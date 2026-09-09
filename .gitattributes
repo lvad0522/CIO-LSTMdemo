@@ -1,0 +1,46 @@
+# ============================================================
+# rd_harness 分发模板（注入业务仓库的版本）
+# 原则：业务方自治，框架不追溯历史文件
+# - * text=auto 让 git 自动检测文本/二进制
+# - 二进制清单防止 git 误处理（不改文件）
+# - 文本文件的 LF/CRLF 由业务方自行决定
+# ============================================================
+
+# --- 默认规则 ---
+* text=auto
+
+# --- 二进制文件（禁止 git 做换行符/编码转换） ---
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.pdf binary
+*.jar binary
+*.war binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.tgz binary
+*.bz2 binary
+*.xz binary
+*.7z binary
+*.class binary
+*.o binary
+*.obj binary
+*.so binary
+*.dylib binary
+*.dll binary
+*.exe binary
+*.bin binary
+*.pyc binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
+*.eot binary
+*.mp3 binary
+*.mp4 binary
+*.webm binary
+*.wav binary
+*.flac binary
