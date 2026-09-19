@@ -302,6 +302,32 @@ def main():
     print(f"  ✓ 展示口径 {DISPLAY_MODE}：skillMap / 时序 r / pred·real / table 行数四处一致")
     passed += 1
 
+    # _display_folds 的两条不变量（口径无关，两分支共用）：
+    #   1) 展示折恒为**实有折的子集**——不许凭空造折
+    #   2) fold1 口径下缺折 1 必须报错，**不许静默换折**：悄悄退到别的折就是悄悄换了
+    #      口径，数字会变而没人知道（同 Dataset 口径修复单里"不许静默回退"的规矩）
+    _orig_folds, _orig_mode = real_data._folds, real_data.DISPLAY_MODE
+    try:
+        real_data._folds = lambda lead, year, kind="pearson2": [2, 3]
+        real_data.DISPLAY_MODE = "foldmax"
+        assert real_data._display_folds(6, 2019) == [2, 3], "foldmax 应返回实有折全集"
+        real_data.DISPLAY_MODE = "fold1"
+        try:
+            real_data._display_folds(6, 2019)
+            raise AssertionError("fold1 口径下缺折 1 应抛 DataNotFoundError，不得静默换折")
+        except real_data.DataNotFoundError:
+            pass
+        real_data._folds = lambda lead, year, kind="pearson2": []
+        try:
+            real_data._display_folds(6, 2019)
+            raise AssertionError("该目录无任何折时应抛 DataNotFoundError")
+        except real_data.DataNotFoundError:
+            pass
+    finally:
+        real_data._folds, real_data.DISPLAY_MODE = _orig_folds, _orig_mode
+    print("  ✓ _display_folds 守卫：展示折 ⊆ 实有折；fold1 缺折 1 报错不静默换折")
+    passed += 1
+
     # ── 12. pre7 单折走 HTTP ──
     print("\n[12] pre7 单折（HTTP）")
     with urllib.request.urlopen(f"{API}/api/run?year=2000&lead=pre7", timeout=30) as resp:
