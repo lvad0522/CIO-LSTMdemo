@@ -10,9 +10,11 @@ import SkillMap from './components/SkillMap';
 import TimeSeriesChart from './components/TimeSeriesChart';
 import ModelCompareChart from './components/ModelCompareChart';
 import ResultsTable from './components/ResultsTable';
+import LivePredictionResult from './components/LivePredictionResult';
 import './App.css';
 
-const API_BASE = 'http://localhost:8000';
+// 后端地址：默认 8000，可用 VITE_API_BASE 覆盖（如换端口起第二套后端时不改代码）
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
 
 const defaultParams = {
   cioFilterLow: 0.02,
@@ -34,15 +36,89 @@ export default function App() {
   // 时序图当前格点（默认 (40,50) 与 /api/run 默认一致；点击热力图后更新）
   // 显示顺序统一为 (经度, 纬度) = (j, i)：横轴=经度、纵轴=纬度（2026-08-25）
   const [selectedGrid, setSelectedGrid] = useState({ i: 40, j: 50 });
+  const [cioFile, setCioFile] = useState(null);
+  const [uploadKind, setUploadKind] = useState('npy');  // 'npy'（CIO 序列）| 'zip'（原始气象场）
+  const [predictionJob, setPredictionJob] = useState(null);
 
   const handleParamChange = useCallback((key, value) => {
     setParams(prev => ({ ...prev, [key]: value }));
+  }, []);
+
+  const handleDataSourceChange = useCallback((nextSource) => {
+    setDataSource(nextSource);
+    setResults(null);
+    setPredictionJob(null);
+    setError(null);
+    if (nextSource === 'upload') {
+      setActiveModule('lstm');
+      setParams(prev => ({ ...prev, predYear: 2000, leadTime: 'pre1' }));
+    }
+  }, []);
+
+  const handleCioFileChange = useCallback((file) => {
+    setCioFile(file);
+    setPredictionJob(null);
+    setResults(null);
+    setError(null);
+  }, []);
+
+  // 切换上传类别（.npy / .zip）时必须丢掉上一个文件，否则扩展名与类别对不上
+  const handleUploadKindChange = useCallback((nextKind) => {
+    setUploadKind(nextKind);
+    setCioFile(null);
+    setPredictionJob(null);
+    setResults(null);
+    setError(null);
   }, []);
 
   const handleRun = useCallback(async () => {
     setRunning(true);
     setError(null);
     try {
+      if (dataSource === 'upload') {
+        if (activeModule !== 'lstm') {
+          throw new Error('当前临时验证只接入 LSTM 降雨预测模块');
+        }
+        if (!cioFile) {
+          throw new Error(uploadKind === 'zip'
+            ? '请先选择原始气象场 .zip 文件'
+            : '请先选择一维 CIO .npy 文件');
+        }
+
+        setResults(null);
+        setPredictionJob({
+          status: 'uploading',
+          stage: uploadKind === 'zip' ? '正在上传原始气象场' : '正在上传 CIO.npy',
+          progress: 0,
+        });
+        const form = new FormData();
+        form.append('file', cioFile);
+        const query = new URLSearchParams({ year: 2000, lead: 'pre1' });
+        // 原始场入口必须显式声明类别（后端会再和文件名对一遍，冲突即报错）
+        if (uploadKind === 'zip') query.set('which', 'u850');
+        const createRes = await fetch(`${API_BASE}/api/predict/jobs?${query}`, {
+          method: 'POST',
+          body: form,
+        });
+        const created = await createRes.json();
+        if (!createRes.ok) throw new Error(created.detail || `任务创建失败 (${createRes.status})`);
+        setPredictionJob(created);
+
+        let job = created;
+        for (let attempt = 0; attempt < 1800; attempt += 1) {
+          if (job.status === 'completed') break;
+          if (job.status === 'failed') throw new Error(job.error || '模型推理失败');
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          const statusRes = await fetch(`${API_BASE}/api/predict/jobs/${created.jobId}`);
+          job = await statusRes.json();
+          if (!statusRes.ok) throw new Error(job.detail || `进度查询失败 (${statusRes.status})`);
+          setPredictionJob(job);
+        }
+        if (job.status !== 'completed') throw new Error('模型推理等待超过 30 分钟');
+        setPredictionJob(job);
+        return;
+      }
+
       const query = new URLSearchParams({
         year: params.predYear,
         lead: params.leadTime,
@@ -62,7 +138,7 @@ export default function App() {
     } finally {
       setRunning(false);
     }
-  }, [params]);
+  }, [params, dataSource, activeModule, cioFile, uploadKind]);
 
   const handleGridClick = useCallback(async (i, j, region) => {
     setSelectedGrid({ i, j });
@@ -93,8 +169,12 @@ export default function App() {
 
         <DataSelector
           value={dataSource}
-          onChange={setDataSource}
+          onChange={handleDataSourceChange}
           disabled={running}
+          cioFile={cioFile}
+          onCioFileChange={handleCioFileChange}
+          uploadKind={uploadKind}
+          onUploadKindChange={handleUploadKindChange}
         />
 
         <ModuleSelector
@@ -107,9 +187,16 @@ export default function App() {
           module={activeModule}
           params={params}
           onChange={handleParamChange}
+          liveModelMode={dataSource === 'upload'}
         />
 
-        <RunButton onRun={handleRun} running={running} disabled={false} />
+        <RunButton
+          onRun={handleRun}
+          running={running}
+          disabled={dataSource === 'upload' && (!cioFile || activeModule !== 'lstm')}
+          progress={predictionJob?.progress || 0}
+          stage={predictionJob?.stage || ''}
+        />
 
         <div className="sidebar-footer">
           <p>基于 Zhou et al. (2024) GRL</p>
@@ -124,11 +211,27 @@ export default function App() {
             <button onClick={() => setError(null)} className="error-close">✕</button>
           </div>
         )}
-        {!results && (
+        {!results && !predictionJob && !running && (
           <div className="empty-state">
             <h2>选择参数后点击"运行"</h2>
             <p>左侧面板设置参数 → 点击运行按钮 → 结果将展示在这里</p>
           </div>
+        )}
+
+        {running && dataSource === 'upload' && (
+          <div className="empty-state">
+            <h2>{predictionJob?.stage || '正在创建模型任务'}</h2>
+            <p>
+              真实进度：{Math.round(predictionJob?.progress || 0)}% ·
+              {uploadKind === 'zip'
+                ? ' 前 30% 为原始场投影，其后为逐格点加载并运行模型'
+                : ' 后端正在逐格点加载并运行模型'}
+            </p>
+          </div>
+        )}
+
+        {predictionJob?.status === 'completed' && dataSource === 'upload' && activeModule === 'lstm' && (
+          <LivePredictionResult job={predictionJob} confidence={params.cioSignificance} />
         )}
 
         {results && activeModule === 'cio' && dataSource === 'upload' && !results.cioTS && (
@@ -180,7 +283,7 @@ export default function App() {
           </div>
         )}
 
-        {results && activeModule === 'lstm' && (
+        {results && dataSource === 'default' && activeModule === 'lstm' && (
           <>
             <div className="result-row">
               <div className="result-col">

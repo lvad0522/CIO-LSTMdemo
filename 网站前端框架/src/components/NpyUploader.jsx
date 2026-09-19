@@ -1,68 +1,83 @@
 import { useRef, useState } from 'react';
 
-const API_BASE = 'http://localhost:8000';
+const CONFIG = {
+  npy: {
+    ext: '.npy',
+    dropzone: '拖拽 CIO .npy 到此处，或点击选择文件',
+    badType: '仅支持 .npy 文件（一维 projected CIO 序列）',
+    contract: (
+      <>
+        接受长度 <strong>2352</strong>（官方 21 年 × 112）或 <strong>2240</strong>（训练长度）
+        的一维 projected CIO 序列，两者都按训练口径「切前 2240 点 → 整段 min-max → 取首年 112 点」。
+        更短的序列（≥112 点，例如缺月份的真实件）按整段自归一化并给出警告。
+      </>
+    ),
+  },
+  zip: {
+    ext: '.zip',
+    dropzone: '拖拽原始气象场 .zip 到此处，或点击选择文件',
+    badType: '仅支持 .zip 文件（打包的原始气象场）',
+    contract: (
+      <>
+        打包 <strong>5–9 月逐日原始场 nc</strong>（每个文件只含 2–29 日，28 天/月；
+        21 年 × 5 月 = 105 个），上传后由后端现场投影为 CIO。
+        文件名需含 <code>u850</code> / <code>uwnd</code> 关键字；zip 里必须含 2000 年。
+      </>
+    ),
+  },
+};
 
-export default function NpyUploader() {
+export default function NpyUploader({ kind = 'npy', file, onFileChange, disabled = false }) {
   const [dragOver, setDragOver] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const inputRef = useRef(null);
+  const config = CONFIG[kind] || CONFIG.npy;
 
-  const upload = async (file) => {
-    if (!file) return;
-    if (!file.name.toLowerCase().endsWith('.npy')) {
-      setError('仅支持 .npy 文件');
-      setResult(null);
+  const selectFile = (nextFile) => {
+    if (!nextFile) return;
+    if (!nextFile.name.toLowerCase().endsWith(config.ext)) {
+      setError(config.badType);
+      onFileChange?.(null);
       return;
     }
-    setUploading(true);
     setError(null);
-    setResult(null);
-    const form = new FormData();
-    form.append('file', file);
-    try {
-      const res = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: form });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || `上传失败 (${res.status})`);
-      setResult(data);
-    } catch (err) {
-      setError(err.message || '连接后端失败，请确认后端已启动');
-    } finally {
-      setUploading(false);
-    }
+    onFileChange?.(nextFile);
   };
 
   return (
     <div className="panel-section">
       <h3 className="section-title">上传数据</h3>
       <div
-        className={`upload-dropzone ${dragOver ? 'drag-over' : ''} ${uploading ? 'uploading' : ''}`}
-        onClick={() => inputRef.current?.click()}
+        className={`upload-dropzone ${dragOver ? 'drag-over' : ''} ${disabled ? 'uploading' : ''}`}
+        onClick={() => !disabled && inputRef.current?.click()}
         onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
         onDragLeave={() => setDragOver(false)}
-        onDrop={(e) => { e.preventDefault(); setDragOver(false); upload(e.dataTransfer.files?.[0]); }}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragOver(false);
+          if (!disabled) selectFile(e.dataTransfer.files?.[0]);
+        }}
       >
         <input
           ref={inputRef}
           type="file"
-          accept=".npy"
+          accept={config.ext}
           hidden
-          onChange={(e) => upload(e.target.files?.[0])}
+          disabled={disabled}
+          onChange={(e) => selectFile(e.target.files?.[0])}
         />
-        {uploading ? <span>上传中…</span> : (
-          <span className="upload-hint">拖拽 .npy 到此处，或点击选择文件</span>
-        )}
+        <span className="upload-hint">{config.dropzone}</span>
       </div>
-      {result && (
+      {file && (
         <div className="upload-result">
-          <span className="upload-ok">✓ {result.filename}</span>
+          <span className="upload-ok">✓ {file.name}</span>
           <span className="param-hint">
-            形状 ({result.shape.join(', ')}) · {result.dtype}
+            {(file.size / 1024 / 1024).toFixed(2)} MB · 点击“运行”后上传并推理
           </span>
         </div>
       )}
       {error && <div className="upload-error">⚠️ {error}</div>}
+      <p className="param-hint upload-contract">{config.contract}</p>
     </div>
   );
 }
