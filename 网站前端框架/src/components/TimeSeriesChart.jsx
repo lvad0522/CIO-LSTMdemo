@@ -46,8 +46,8 @@ export default function TimeSeriesChart({ data, gridLabel }) {
     pred: pred[i],
   }));
 
-  // 优先用后端数据集口径的 r（= 热力图同格点颜色，6-fold r 平均），
-  // 无 r 字段（mock 降级）时回退本地重算
+  // 优先用后端返回的 r（与热力图同格点同源，口径由 real_data.DISPLAY_MODE 决定；
+  // 此处**不做任何口径假设**），无 r 字段（mock 降级）时回退本地重算
   const r = data.r !== undefined ? data.r : calcR2(real, pred);
 
   return (

@@ -1,4 +1,4 @@
-"""真实数据加载模块 —— 从 Dataset/ 加载 CIO+LSTM 降水预测的真实输出。
+"""真实数据加载模块 —— 加载 CIO+LSTM 降水预测的真实输出（Dataset/ + 重训产出的 model/）。
 
 数据源约定
 ==========
@@ -6,11 +6,14 @@
   `pre_{lead}_{year}({fold})_20_40_100_125_0.25_{type}2.npy`
   - lead: 提前期 1-20（pre1~pre20）
   - year: 2000-2019
-  - fold: 1-6（LSTM 重复实验）
+  - fold: 1-6（LSTM 重复实验）；**pre7 重训后只有 1**，折数一律用 `_folds()` 实查。
+    展示用哪几折由 `DISPLAY_MODE` 决定（foldmax=各折取最大 / fold1=只折 1）
   - type: pearson2 / predict2 / real2
 - 区域：东亚 20-40°N, 100-125°E @0.25°，网格 81×101（GRID_ROWS×GRID_COLS）
 - 时间：112 天（6-9 月每月 2-29 号）
 - 数据根目录：默认 `../Dataset`（相对 backend 目录），可用环境变量 `DATA_ROOT` 覆盖
+- 重训 lead 改指 `{MODEL_ROOT}/`（默认 `../model`，环境变量 `MODEL_ROOT` 覆盖），
+  逐 lead 登记在 `LEAD_DATA_DIRS`（含是否平铺），见 `_year_dir()`
 
 文件语义（源自 main_India_new.py，见 gen_guide.py:711-810）
 - pearson2: 形状 (81,101,3) = [行索引, 列索引, Pearson r]（第 3 通道才是 r）
@@ -18,11 +21,21 @@
 - real2:   形状 (81,101,112) float64，真实滤波后降水（带通滤波，58% 负值）
 - pearson 中的 NaN 已被生成脚本替换为 0（0 可能是"无有效相关"而非真实 r=0）
 
-已知数据情况（2026-08-25 实测）
+已知数据情况（2026-08-25 实测；命名口径 2026-09-17 修订；pre7 2026-09-19 接新件）
+- **旧 pre7 是坏模型**（输入是常数垃圾场，输出年不变、r 虚高）：论文口径跨 20 年平均
+  0.1534，其余 19 个 lead 只有 0.1240~0.1287。2026-09-19 起改用重训批次——干净输入、
+  20 年平均 +0.1274，落在健康区间。**新件在 `model/pre7_单折/`，且只有折 1**，由
+  `_year_dir()` 接手；`Dataset/pre7/` 那 360 个旧件原封未动（不删不改，留作对照）。
+  显示口径 2026-09-19 已拍板为**全站只用折 1**（见下"统计口径说明"）——单折的 pre7
+  与 6 折的邻居只有在这个口径下才可比
 - pre19/2002 的 6 个 real2 原缺失，已用 pre1/2002 同 fold 复制填补
   （2002 年 real2 跨 pre1~pre20 逐字节一致——真实值不依赖 lead；pearson2 随 lead 变化，勿同法处理）
-- pre3/pre5/pre20 存在 300 个畸形冗余 predict2 文件（缺左括号，如 pre_3_20001)_...），
-  加载一律使用精确文件名，不参与任何加载逻辑
+  [2026-09-19 复核：填补件与 pre1/2002 同 fold 逐字节一致，且 mtime 秒级继承自 pre1/2002
+   （copy2 保留时间戳），确认系本地填补操作，非原始产出]
+- pre3/pre5 全部年份 + pre20 的 2010-2019 共 50 个目录里混了**两批** predict2：正常名的是
+  "第一遍"，缺左括号的（如 pre_3_20001)_...，共 300 个）是"第二遍"。目录里的 pearson2
+  **全部由第二遍算出**（恒等式复核 50/50 成立），故 predict2 优先取第二遍那份，见 _file_path。
+  磁盘上一律不动——改名会永久覆盖第一遍，无法回退
 
 source 标记约定
 - dict 型字段（skillMap/timeSeries）及 list 元素（table/s2s）带 `"source"`：
@@ -30,12 +43,24 @@ source 标记约定
 - CIO 模块（cioTS/cioCorr）：mock 已于 2026-08-25 关停（伪造数据会误导用户），
   /api/run 返回 null；待上传 SST+Uwind 的真实计算接入后再恢复
 
-统计口径说明
-- skillMap 的 r 为 6 个 fold 逐格点取最大值（最乐观 fold，2026-08-28 按需求调整，
-  原为平均）；timeSeries 的 "r" 字段与热力图同口径（同取 fold 最大值），保证同格点一致
-- timeSeries 的 pred/real 曲线仍为 6 个 fold 逐时间点平均（降水序列展示，非技能评分）
+统计口径说明（**两条分支的唯一差别：`DISPLAY_MODE` 常量**）
+- 两个展示口径，两条分支的代码除该常量外完全一致（见 `_display_folds()`）：
+  - `"foldmax"`（**main**，2026-08-28 起）：逐格点取各折最大值（最乐观折）
+  - `"fold1"`（**feature/display-single-fold**）：只取折 1（一次训练）
+- **为什么要有 fold1**：pre7 重训件只有折 1，"折最大"对它等于它自己，与邻居 6 折取最大
+  不可比（2003 年 S2S 蓝框：pre7 0.3410 而邻居 ~0.50，看着像 pre7 最差）；统一折 1 后
+  pre7 0.3410 落在邻居 0.32~0.38 区间内。代价：单折单格点噪声大、可为负
+  （2000 年 pre6 @(40,50) = 0.0102），这是折 1 的真实水平
+- **为什么 main 仍留 foldmax**：foldmax 不是任何一次训练的能力，实测把全网格平均放大
+  约 2.2~3.7 倍（2000 年 0.15 → 0.36）。保留它只为对照，对外口径以 fold1 分支为准
+- 两个口径下 **skillMap 与 timeSeries 的 "r" 都同源同口径**（同走 `_display_pearson()`），
+  保证同格点颜色与数字一致
+- foldmax 的 pred/real 曲线是**各折逐时间点平均**（"最大"对时间序列无意义）；
+  fold1 是折 1 的原始序列。两者都走 `_display_series()`
 - table 的 r/RMSE/MAE 为全网格全序列池化计算（predict2 vs real2），
-  与论文"逐格点 r 区域平均"口径不同，仅作稳定性展示
+  与论文"逐格点 r 区域平均"口径不同，仅作稳定性展示；foldmax 6 行 / fold1 1 行
+- `_folds()` 保留：`verify_dataset` 仍按**实际存在的折**做完整性校验（数据层面的事，
+  与展示口径无关）
 """
 
 import os
@@ -46,10 +71,28 @@ from collections import OrderedDict
 import numpy as np
 
 # ── 路径与常量 ────────────────────────────────────────────
-DATA_ROOT = os.environ.get(
-    "DATA_ROOT",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Dataset"),
-)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = os.environ.get("DATA_ROOT", os.path.join(_HERE, "..", "Dataset"))
+# 模型侧产出根目录（2026-09-19 规矩：用 .pt 跑出来的东西放 model/，不往 Dataset/ 塞）
+MODEL_ROOT = os.environ.get("MODEL_ROOT", os.path.join(_HERE, "..", "model"))
+
+# 数据目录逐 lead 解析：默认 Dataset/pre{lead}/{year}/；重训过的 lead 在此登记，
+# 值为 (根目录, 是否平铺)。Dataset/ 按年份分子目录，model/ 下的重训产出平铺一层
+# （年份已编码在文件名里）。加新条目即可，其余代码不用动。见 model/README.md 与
+# 摸库交付_2026-09-15/04_文档/pre7单折与显示口径_给后端agent.md
+LEAD_DATA_DIRS = {
+    7: (os.path.join(MODEL_ROOT, "pre7_单折"), True),   # 09-16 用干净输入重训，仅折 1
+}
+
+
+def _year_dir(lead, year):
+    """该 (lead, year) 的文件所在目录（Dataset/ 是 pre{lead}/{year}/，重训产出是平铺）。"""
+    spec = LEAD_DATA_DIRS.get(lead)
+    if spec is None:
+        return os.path.join(DATA_ROOT, f"pre{lead}", str(year))
+    root, flat = spec
+    return root if flat else os.path.join(root, str(year))
+
 
 FILE_PATTERN = re.compile(
     r"^pre_(\d+)_(\d{4})\((\d)\)_20_40_100_125_0\.25_(pearson2|predict2|real2)\.npy$"
@@ -58,12 +101,19 @@ FILE_PATTERN = re.compile(
 GRID_ROWS = 81
 GRID_COLS = 101
 N_DAYS = 112
-N_FOLDS = 6
+# 重复次数（"折"）不写死：多数 lead 是 6，pre7 重训后只有 1。一律用 _folds() 实查
 LEADS = list(range(1, 21))
 YEARS = list(range(2000, 2020))
 
-# 数据完整性：2026-08-25 起 7200 个文件全部齐备
-# （pre19/2002 的 6 个 real2 曾缺失，已用 pre1/2002 同 fold 复制填补，见模块 docstring）
+# 数据完整性：2026-09-19 起期望 6900 个文件（= 19 个 lead × 20 年 × 6 折 × 3 + pre7 的
+# 20 年 × 1 折 × 3）。pre19/2002 的 6 个 real2 曾缺失，已用 pre1/2002 同 fold 复制填补；
+# pre7 换成 model/ 下的单折重训件，见模块 docstring
+
+# ── 展示口径（**两条分支只差这一个常量**）────────────────
+# "foldmax"：逐格点取各折最大值（最乐观折，2026-08-28 起的口径）—— main 分支
+# "fold1"  ：只取折 1（一次训练）—— feature/display-single-fold 分支
+# pre7 重训件只有折 1，只有 fold1 口径下它与邻居才可比。详见模块 docstring。
+DISPLAY_MODE = "foldmax"
 
 
 class ValidationError(ValueError):
@@ -107,11 +157,78 @@ _cache = _LRUCache(capacity=48)
 
 # ── 加载原语 ──────────────────────────────────────────────
 def _file_path(lead, year, fold, kind):
-    """精确拼接文件路径（禁止 glob 通配，避免命中畸形文件）。"""
-    return os.path.join(
-        DATA_ROOT, f"pre{lead}", str(year),
-        f"pre_{lead}_{year}({fold})_20_40_100_125_0.25_{kind}.npy",
-    )
+    """精确拼接文件路径（禁止 glob 通配，避免命中畸形文件）。
+
+    predict2 特例：pre3/pre5 全部年份 + pre20 的 2010-2019 共 50 个目录，里面混有
+    "第二遍"跑出的文件名少左括号的 predict2（如 `pre_3_20001)_...`）；该目录的
+    pearson2 正是由这份算出的（恒等式复核 50/50 成立，见 01_探针/verify_identity_all400.py）。
+    为保证热力图 r 与曲线同源，predict2 优先取这份，没有则回落正常名。
+    pearson2 / real2 的名字是正常的，不受影响。
+    """
+    d = _year_dir(lead, year)
+    if kind == "predict2":
+        m = os.path.join(d, f"pre_{lead}_{year}{fold})_20_40_100_125_0.25_predict2.npy")
+        if os.path.exists(m):
+            return m
+    return os.path.join(d, f"pre_{lead}_{year}({fold})_20_40_100_125_0.25_{kind}.npy")
+
+
+def _folds(lead, year, kind="pearson2"):
+    """该 (lead, year) 目录下**实际存在**的折号（升序）。pre7 重训后只有 [1]。
+
+    只认正常名（带括号）：截断名 `pre_3_20001)_...` 不匹配 FILE_PATTERN，自然被排除，
+    所以不需要额外正则。用 os.listdir + 正则而非 glob 通配。
+    """
+    d = _year_dir(lead, year)
+    out = set()
+    if os.path.isdir(d):
+        for name in os.listdir(d):
+            m = FILE_PATTERN.match(name)
+            if m and int(m.group(1)) == lead and int(m.group(2)) == year \
+                    and m.group(4) == kind:
+                out.add(int(m.group(3)))
+    return sorted(out)
+
+
+def _display_folds(lead, year):
+    """当前展示口径下要参与聚合的折号（`DISPLAY_MODE` 的**唯一**落点）。
+
+    foldmax → 该目录实有的全部折（通常 6）
+    fold1   → [1]
+    缺折 1 时直接抛错，**不静默换折**——悄悄退到别的折就是悄悄换了口径，
+    数字会变而没人知道（同 Dataset 口径修复单里"不许静默回退"的规矩）。
+    """
+    folds = _folds(lead, year, "pearson2")
+    if not folds:
+        raise DataNotFoundError(f"pre{lead}/{year} 无可用折")
+    if DISPLAY_MODE == "fold1":
+        if 1 not in folds:
+            raise DataNotFoundError(f"pre{lead}/{year} 缺折 1，无法按 fold1 口径取数")
+        return [1]
+    return folds
+
+
+def _display_pearson(lead, year):
+    """按展示口径返回该 (lead, year) 的 pearson r 场，(81, 101)。
+
+    热力图与曲线上的 "r" 都从这里取，保证同格点一致。
+    fold1 时只有一折，`np.fmax.reduce` 退化为直接取它自己。
+    """
+    maps = [_load_npy(lead, year, f, "pearson2")[..., 2]
+            for f in _display_folds(lead, year)]
+    return np.fmax.reduce(maps)
+
+
+def _display_series(lead, year, grid_i, grid_j):
+    """按展示口径返回该格点的 (pred, real) 两条 112 天序列。
+
+    fold1 时只有一折，`np.mean` 退化为直接取它自己（各元素完全相等，无精度损失）。
+    """
+    folds = _display_folds(lead, year)
+    preds = [_load_npy(lead, year, f, "predict2")[grid_i, grid_j, :] for f in folds]
+    reals = [_load_npy(lead, year, f, "real2")[grid_i, grid_j, :] for f in folds]
+    return (np.mean(np.stack(preds, axis=0), axis=0),
+            np.mean(np.stack(reals, axis=0), axis=0))
 
 
 def _load_npy(lead, year, fold, kind):
@@ -151,19 +268,30 @@ def _check_grid(i, j):
 
 # ── 数据集完整性校验 ──────────────────────────────────────
 def verify_dataset():
-    """按 7200 个精确文件名逐一检查，返回缺失清单与意外文件统计。
+    """按**实际存在**的折逐一检查，返回缺失清单与意外文件统计。
+
+    折号不写死：以该目录 pearson2 的折集为准（pre7 重训后只有 [1]），再查 predict2 /
+    real2 是否按同一批折配套齐全。整目录查不到 pearson2 也记一笔，避免"没有折 ⇒ 无需
+    检查"的空转（若只按实有折循环，missing 会恒为空，校验就废了）。
 
     返回: {"missing": list[str], "malformed": int, "total_expected": int}
     """
     missing = []
+    total = 0
     for lead in LEADS:
         for year in YEARS:
-            for fold in range(1, N_FOLDS + 1):
+            folds = _folds(lead, year, "pearson2")
+            if not folds:
+                missing.append(_year_dir(lead, year))
+                continue
+            for fold in folds:
                 for kind in ("pearson2", "predict2", "real2"):
+                    total += 1
                     if not os.path.exists(_file_path(lead, year, fold, kind)):
                         missing.append(_file_path(lead, year, fold, kind))
 
-    # 意外文件统计：目录下存在但正则不匹配的 npy（畸形冗余等）
+    # 意外文件统计：目录下存在但正则不匹配的 npy（畸形冗余等）。
+    # 只扫 DATA_ROOT——model/ 是模型产出目录，不属于"数据集"范畴
     malformed = 0
     if os.path.isdir(DATA_ROOT):
         for root, _dirs, names in os.walk(DATA_ROOT):
@@ -173,18 +301,20 @@ def verify_dataset():
     return {
         "missing": missing,
         "malformed": malformed,
-        "total_expected": len(LEADS) * len(YEARS) * N_FOLDS * 3,
+        "total_expected": total,
     }
 
 
 # ── 真实数据 gen_* ────────────────────────────────────────
 def gen_skill_map(year=2019, lead=6):
-    """技能地图：6 个 fold 的 pearson r 逐格点取最大值（最乐观 fold）。"""
+    """技能地图：该 lead 的 pearson r 逐格点图（口径见 `DISPLAY_MODE`）。
+
+    foldmax：逐格点取各折最大（放大 2.2~3.7 倍，不是任何一次训练的能力）
+    fold1  ：折 1 那一次的原始 r 图
+    """
     _check_lead_year(lead, year)
-    r_maps = [_load_npy(lead, year, f, "pearson2")[..., 2] for f in range(1, N_FOLDS + 1)]
-    r_max = np.max(np.stack(r_maps, axis=0), axis=0)
     return {
-        "data": r_max.tolist(),
+        "data": _display_pearson(lead, year).tolist(),
         "rows": GRID_ROWS,
         "cols": GRID_COLS,
         "source": "dataset",
@@ -192,34 +322,29 @@ def gen_skill_map(year=2019, lead=6):
 
 
 def gen_time_series(year=2019, lead=6, grid_i=40, grid_j=50):
-    """格点时序：6 个 fold 的 predict/real 逐时间点平均。
+    """格点时序：该 lead 的 predict/real 序列 + 同格点 r（口径见 `DISPLAY_MODE`）。
 
-    "r" 字段 = 该格点 6 个 fold 的 pearson2 相关最大值（与 gen_skill_map 同口径，
-    最乐观 fold），前端时序图直接展示此值，保证与热力图同格点颜色一致。
-    注意：max(r_fold) ≠ r(mean_pred, mean_real)（非线性算子，平均抑制噪声），
-    因此前端禁止自行重算 r（见 prediction.py 截断/归一化语义）。
+    "r" 与 gen_skill_map 同一次取数，保证与热力图同格点颜色一致。
+    注意：任何口径下前端都**禁止**自行对曲线重算 r（见 prediction.py 的
+    截断/归一化语义），也**禁止**自行改口径。
     """
     _check_lead_year(lead, year)
     _check_grid(grid_i, grid_j)
-    preds = [_load_npy(lead, year, f, "predict2") for f in range(1, N_FOLDS + 1)]
-    reals = [_load_npy(lead, year, f, "real2") for f in range(1, N_FOLDS + 1)]
-    pred_mean = np.mean(np.stack([p[grid_i, grid_j, :] for p in preds], axis=0), axis=0)
-    real_mean = np.mean(np.stack([r[grid_i, grid_j, :] for r in reals], axis=0), axis=0)
-    fold_rs = [_load_npy(lead, year, f, "pearson2")[grid_i, grid_j, 2]
-               for f in range(1, N_FOLDS + 1)]
+    pred, real = _display_series(lead, year, grid_i, grid_j)
+    r = _display_pearson(lead, year)[grid_i, grid_j]
     return {
-        "real": real_mean.tolist(),
-        "pred": pred_mean.tolist(),
-        "r": round(float(np.max(fold_rs)), 4),
+        "real": real.tolist(),
+        "pred": pred.tolist(),
+        "r": round(float(r), 4),
         "source": "dataset",
     }
 
 
 def gen_results_table(year=2019, lead=6):
-    """实验统计表：6 个 fold 各自的池化 r / RMSE / MAE。"""
+    """实验统计表：各展示折的池化 r / RMSE / MAE（foldmax 6 行 / fold1 1 行）。"""
     _check_lead_year(lead, year)
     table = []
-    for fold in range(1, N_FOLDS + 1):
+    for fold in _display_folds(lead, year):
         pred = _load_npy(lead, year, fold, "predict2").flatten()
         real = _load_npy(lead, year, fold, "real2").flatten()
         table.append({
@@ -276,20 +401,20 @@ def _load_s2s_curves():
 
 
 def _recompute_lstm_curve():
-    """按锁定口径重算 LSTM 20 个 lead 的蓝框区域平均 r（缺失 lead 返回 None 断线）。"""
+    """重算 LSTM 20 个 lead 的蓝框区域平均 r（缺折的 lead 返回 None 断线）。
+
+    口径与热力图一致（同走 `_display_pearson`）。foldmax 口径下邻居 ~0.50 而
+    pre7（单折，取最大等于它自己）0.3410 显得最低；fold1 口径下 pre7 落在
+    邻居 0.32~0.38 内 —— 这就是引入 fold1 的直接原因。
+    """
     curve = []
     for lead in S2S_LEADS:
-        fold_rs = []
-        for fold in range(1, N_FOLDS + 1):
-            try:
-                fold_rs.append(_load_npy(lead, S2S_YEAR, fold, "pearson2")[..., 2])
-            except DataNotFoundError:
-                continue
-        if not fold_rs:
+        try:
+            r_map = _display_pearson(lead, S2S_YEAR)
+        except DataNotFoundError:
             curve.append(None)
             continue
-        max_field = np.fmax.reduce(fold_rs)
-        curve.append(float(max_field[ROI_ROW_SLICE, ROI_COL_SLICE].mean()))
+        curve.append(float(r_map[ROI_ROW_SLICE, ROI_COL_SLICE].mean()))
     return curve
 
 

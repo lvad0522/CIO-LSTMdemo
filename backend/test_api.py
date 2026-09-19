@@ -22,6 +22,13 @@ API = "http://localhost:8000"
 passed = 0
 failed = 0
 
+# 展示口径由 real_data.DISPLAY_MODE 决定（**两条分支只差这一个常量**）。
+# 本测试两条分支共用：期望值按当前口径算，不写死行数/折号。
+import real_data
+
+DISPLAY_MODE = real_data.DISPLAY_MODE
+TABLE_ROWS = 1 if DISPLAY_MODE == "fold1" else 6
+
 
 def test(name, method="GET", path="/", expect_status=200, checks=None):
     """发起 HTTP 请求并验证返回。"""
@@ -87,8 +94,10 @@ def main():
         assert key in data, f"缺少字段: {key}"
     assert data["cioTS"] is None, "CIO mock 已关停，cioTS 应为 null"
     assert data["cioCorr"] is None, "CIO mock 已关停，cioCorr 应为 null"
-    assert len(data["s2s"]) == 12, f"s2s 应为 12 个模型, 实际 {len(data['s2s'])}"
-    assert len(data["table"]) == 6, f"table 应为 6 行, 实际 {len(data['table'])}"
+    # S2S 走真实数据（新绘图资料/corr-2003.nc）：每个 lead 一行，不是 mock 的 12 个模型
+    assert len(data["s2s"]) == 20, f"s2s 应为 20 行（lead 1-20）, 实际 {len(data['s2s'])}"
+    assert len(data["table"]) == TABLE_ROWS, \
+        f"table 应为 {TABLE_ROWS} 行（口径 {DISPLAY_MODE}）, 实际 {len(data['table'])}"
     assert data["skillMap"]["rows"] == 81, f"skillMap rows 应为 81, 实际 {data['skillMap']['rows']}"
     assert data["skillMap"]["cols"] == 101, f"skillMap cols 应为 101, 实际 {data['skillMap']['cols']}"
     assert len(data["timeSeries"]["real"]) == 112
@@ -107,7 +116,7 @@ def main():
     assert data["skillMap"]["source"] == "dataset"
     assert data["timeSeries"]["source"] == "dataset"
     assert data["table"][0]["source"] == "dataset"
-    assert all(m["source"] == "mock" for m in data["s2s"])
+    assert all(m["source"] == "dataset" for m in data["s2s"])
     print("  ✓ source 标记正确（dataset/mock 区分；cioTS/cioCorr 已关停 mock 为 null）")
     passed += 1
 
@@ -141,7 +150,7 @@ def main():
     assert all(isinstance(v, (int, float)) for v in ts["real"])
     assert all(isinstance(v, (int, float)) for v in ts["pred"])
     assert ts["source"] == "dataset"
-    print("  ✓ 返回 real/pred 各 112 天（6-fold 平均），source=dataset")
+    print("  ✓ 返回 real/pred 各 112 天（折 1 原始序列），source=dataset")
     passed += 1
 
     # 显式 year/lead 与默认参数一致（i=40,j=50 是默认格点）
@@ -168,8 +177,8 @@ def main():
     # /api/run 整体依赖 table（需要 real2），填补后应正常返回 6 行
     with urllib.request.urlopen(f"{API}/api/run?year=2002&lead=pre19", timeout=30) as resp:
         run19 = json.loads(resp.read().decode())
-    assert len(run19["table"]) == 6, "填补后 table 应为 6 行"
-    print("  ✓ /api/run pre19/2002 正常返回，table 6 行")
+    assert len(run19["table"]) == TABLE_ROWS, f"填补后 table 应为 {TABLE_ROWS} 行"
+    print(f"  ✓ /api/run pre19/2002 正常返回，table {TABLE_ROWS} 行")
     passed += 1
 
     # ── 8. 实验统计表可复现 ──
@@ -179,10 +188,12 @@ def main():
     with urllib.request.urlopen(f"{API}/api/run?year=2015&lead=pre10") as resp:
         t2 = json.loads(resp.read().decode())["table"]
     assert t1 == t2, "同一 (year, lead) 两次请求 table 应完全一致"
-    assert [row["experiment"] for row in t1] == [1, 2, 3, 4, 5, 6]
+    expected_exps = [1] if DISPLAY_MODE == "fold1" else [1, 2, 3, 4, 5, 6]
+    assert [row["experiment"] for row in t1] == expected_exps, \
+        f"experiment 列应为 {expected_exps}（口径 {DISPLAY_MODE}）"
     assert all(0 < row["pearsonR"] < 1 for row in t1)  # 池化 r 应为正
     assert all(row["rmse"] > 0 and row["mae"] > 0 for row in t1)
-    print("  ✓ table 6 行可复现，r/RMSE/MAE 均为真实计算值")
+    print(f"  ✓ table {TABLE_ROWS} 行可复现，r/RMSE/MAE 均为真实计算值")
     passed += 1
 
     # ── 9. S2S 对比 ──
@@ -190,11 +201,15 @@ def main():
     url = f"{API}/api/s2s"
     with urllib.request.urlopen(url) as resp:
         data = json.loads(resp.read().decode())
-    assert len(data) == 12
-    names = [m["name"] for m in data]
-    assert "LSTM+CIO" in names, "缺少 LSTM+CIO"
-    assert all("r" in m for m in data)
-    print("  ✓ 12 个模型，含 LSTM+CIO（mock 降级，source=mock）")
+    # 真实数据：每个 lead 一行（1-20），每行含 11 个 S2S 模式 + S2S_Mean + LSTM
+    # （mock 降级时才是 12 个模型的柱状结构——corr-2003.nc 在，走不到那条路）
+    assert len(data) == 20, f"S2S 应为 20 行（每 lead 一行）, 实际 {len(data)}"
+    assert [r["lead"] for r in data] == list(range(1, 21)), "lead 应为 1-20"
+    assert all(r["source"] == "dataset" for r in data)
+    assert all("LSTM" in r and "S2S_Mean" in r for r in data)
+    # pre7 换单折后仍应出值（旧代码会因 fold≥2 缺文件而静默断线）
+    assert data[6]["LSTM"] is not None, "pre7 的 LSTM 那格不应为 None"
+    print("  ✓ 20 行（lead 1-20），含 S2S_Mean/LSTM，source=dataset；pre7 有值")
     passed += 1
 
     # ── 10. 上传接口 ──
@@ -225,18 +240,78 @@ def main():
     print("\n[11] 数据集完整性校验")
     import real_data
     v = real_data.verify_dataset()
-    assert v["total_expected"] == 7200, f"期望 7200 文件, 实际 {v['total_expected']}"
+    # 2026-09-19：pre7 换成 model/pre7_单折/ 的单折重训件，期望由 7200 降为 6900
+    # （= 19 lead × 20 年 × 6 折 × 3 + pre7 20 年 × 1 折 × 3）
+    assert v["total_expected"] == 6900, f"期望 6900 文件, 实际 {v['total_expected']}"
     assert len(v["missing"]) == 0, f"期望 0 缺失（pre19/2002 已填补）, 实际 {len(v['missing'])}"
     assert v["malformed"] == 300, f"期望 300 个意外文件, 实际 {v['malformed']}"
-    print("  ✓ verify_dataset: 7200 期望 / 0 缺失（pre19/2002 real2 已填补）/ 300 畸形冗余")
+    print("  ✓ verify_dataset: 6900 期望 / 0 缺失（pre19/2002 real2 已填补）/ 300 畸形冗余")
     passed += 1
-    # 精确加载不命中畸形文件（S11）
+    # 口径修复（2026-09-17）：那 50 个目录的 pearson2 由"第二遍"的截断名 predict2 算出，
+    # 故 predict2 优先解析到截断名（保证热力图 r 与曲线同源）；real2 与干净目录不变。
+    # 详见 摸库交付_2026-09-15/04_文档/Dataset口径修复单_给后端agent.md
     p1 = real_data._file_path(3, 2000, 1, "predict2")
     p2 = real_data._file_path(3, 2000, 1, "real2")
-    assert p1.replace("(", ")") != p1  # 畸形文件名缺左括号，正常路径必含
+    p3 = real_data._file_path(6, 2019, 1, "predict2")
+    assert p1.endswith("pre_3_20001)_20_40_100_125_0.25_predict2.npy"), \
+        f"脏目录 predict2 应取截断名, 实际 {p1}"
+    assert p2.endswith("pre_3_2000(1)_20_40_100_125_0.25_real2.npy"), \
+        f"real2 不应受修复影响, 实际 {p2}"
+    assert p3.endswith("pre_6_2019(1)_20_40_100_125_0.25_predict2.npy"), \
+        f"干净目录应仍是正常名, 实际 {p3}"
     arr = real_data._load_npy(3, 2000, 1, "predict2")
     assert not bool(np.isnan(arr).any()), "精确加载结果不应含 NaN"
-    print("  ✓ 精确加载（pre3/2000 fold1）无 NaN，不命中畸形文件")
+    print("  ✓ 口径修复：脏目录 predict2 取截断名 / real2 与干净目录不变，加载无 NaN")
+    passed += 1
+
+    # pre7 单折（2026-09-19 接入 model/pre7_单折/，数据不再走 Dataset/pre7）
+    # 折号不再写死：pre7 只有折 1，其余 lead 仍 6 折。见
+    # 摸库交付_2026-09-15/04_文档/pre7单折与显示口径_给后端agent.md 第二节
+    assert real_data._folds(7, 2000) == [1], \
+        f"pre7 应只有折 1, 实际 {real_data._folds(7, 2000)}"
+    assert real_data._folds(6, 2000) == [1, 2, 3, 4, 5, 6], "pre6 应仍是 6 折"
+    assert real_data._folds(3, 2000, "predict2") == [1, 2, 3, 4, 5, 6], \
+        "脏目录的截断名不应被算成折号"
+    assert len(real_data.gen_results_table(2000, 7)) == 1, "pre7 table 应只有 1 行"
+    assert real_data.gen_skill_map(2000, 7)["rows"] == 81
+    assert len(real_data.gen_time_series(2000, 7, 40, 50)["real"]) == 112
+    print("  ✓ pre7 单折：_folds(7,2000)=[1]，skillMap/timeSeries/table 均不抛 DataNotFoundError")
+    passed += 1
+
+    # 展示口径（real_data.DISPLAY_MODE）：main=foldmax（各折逐格点取最大）/
+    # feature/display-single-fold=fold1（只取折 1）。两条分支共用本测试，期望值按当前口径算。
+    for lead, year in ((6, 2019), (1, 2000), (7, 2000), (19, 2002)):
+        want = [1] if DISPLAY_MODE == "fold1" else real_data._folds(lead, year, "pearson2")
+        assert real_data._display_folds(lead, year) == want, \
+            f"pre{lead}/{year} 展示折应为 {want}（口径 {DISPLAY_MODE}）"
+        want_r = np.fmax.reduce([real_data._load_npy(lead, year, f, "pearson2")[..., 2]
+                                 for f in want])
+        sm = np.array(real_data.gen_skill_map(year, lead)["data"])
+        assert np.array_equal(sm, want_r), \
+            f"pre{lead}/{year} skillMap 与展示口径不符（口径 {DISPLAY_MODE}）"
+        ts = real_data.gen_time_series(year, lead, 40, 50)
+        assert ts["r"] == round(float(want_r[40, 50]), 4), \
+            f"pre{lead}/{year} 时序 r 应与热力图同格点同源"
+        for key, kind in (("pred", "predict2"), ("real", "real2")):
+            want_series = np.mean(np.stack(
+                [real_data._load_npy(lead, year, f, kind)[40, 50, :] for f in want], 0), 0)
+            assert np.allclose(ts[key], want_series), \
+                f"pre{lead}/{year} {key} 与展示口径不符"
+        assert len(real_data.gen_results_table(year, lead)) == len(want), \
+            f"pre{lead}/{year} table 行数应等于展示折数"
+    print(f"  ✓ 展示口径 {DISPLAY_MODE}：skillMap / 时序 r / pred·real / table 行数四处一致")
+    passed += 1
+
+    # ── 12. pre7 单折走 HTTP ──
+    print("\n[12] pre7 单折（HTTP）")
+    with urllib.request.urlopen(f"{API}/api/run?year=2000&lead=pre7", timeout=30) as resp:
+        run7 = json.loads(resp.read().decode())
+    assert len(run7["table"]) == 1, f"pre7 table 应 1 行, 实际 {len(run7['table'])}"
+    assert run7["skillMap"]["rows"] == 81 and run7["skillMap"]["cols"] == 101
+    with urllib.request.urlopen(f"{API}/api/grid?i=40&j=50&year=2000&lead=pre7", timeout=30) as resp:
+        g7 = json.loads(resp.read().decode())
+    assert len(g7["real"]) == 112 and len(g7["pred"]) == 112
+    print("  ✓ /api/run 与 /api/grid 对 pre7 正常（table 1 行、序列 112 天）")
     passed += 1
 
     # ── 汇总 ──

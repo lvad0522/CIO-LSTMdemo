@@ -84,8 +84,8 @@ export default function ModelCompareChart({ data }) {
         </ResponsiveContainer>
         </div>
         <p className="chart-note">
-          数据来源: 真实 S2S 数据（corr-2003.nc / corr-avg-2003.nc）与 LSTM 蓝框
-          6-fold max 重算（{data[0]?.source === 'dataset' ? 'dataset' : ''}）
+          数据来源: 真实 S2S 数据（corr-2003.nc / corr-avg-2003.nc）与 LSTM 蓝框区域平均重算
+          {data[0]?.source === 'dataset' ? '（dataset）' : ''}
         </p>
       </div>
     );
