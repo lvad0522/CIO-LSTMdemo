@@ -47,10 +47,12 @@ source 标记约定
 - CIO 模块（cioTS/cioCorr）：mock 已于 2026-08-25 关停（伪造数据会误导用户），
   /api/run 返回 null；待上传 SST+Uwind 的真实计算接入后再恢复
 
-统计口径说明（**两条分支的唯一差别：`DISPLAY_MODE` 常量**）
-- 两个展示口径，两条分支的代码除该常量外完全一致（见 `_display_folds()`）：
-  - `"foldmax"`（**main**，2026-08-28 起）：逐格点取各折最大值（最乐观折）
-  - `"fold1"`（**feature/display-single-fold**）：只取折 1（一次训练）
+统计口径说明（**两条分支的唯一差别：`DISPLAY_MODE` 的默认值**）
+- 两个展示口径，两条分支的代码除默认值外完全一致（见 `_display_folds()`）：
+  - `"foldmax"`（**main** 默认，2026-08-28 起）：逐格点取各折最大值（最乐观折）
+  - `"fold1"`（**feature/display-single-fold** 默认）：只取折 1（一次训练）
+- **同时开两种口径**：`DISPLAY_MODE` 环境变量覆盖默认值即可，无需第二份代码/数据集
+  （`DISPLAY_MODE=foldmax uvicorn main:app --port 8002`）。取值非法**直接抛错**，不静默回落
 - **为什么要有 fold1**：只有折 1 对应**一次真实训练**——foldmax 是逐格点挑最乐观折、
   foldmean 也不是任何一次训练的结果，两者都不是任何模型的能力。2026-09-19 引入时还有个
   直接动因：当时 pre7 只有折 1，"折最大"对它等于它自己，与邻居 6 折取最大不可比
@@ -115,11 +117,17 @@ YEARS = list(range(2000, 2020))
 # + pre7 的 20 年 × 1 折 × 3），pre7 折 2~6 落齐后回到 7200。pre19/2002 的 6 个 real2 曾缺失，
 # 已用 pre1/2002 同 fold 复制填补。见模块 docstring
 
-# ── 展示口径（**两条分支只差这一个常量**）────────────────
-# "foldmax"：逐格点取各折最大值（最乐观折，2026-08-28 起的口径）—— main 分支
-# "fold1"  ：只取折 1（一次训练）—— feature/display-single-fold 分支
+# ── 展示口径（**两条分支只差下面这一行的默认值**）──────────
+# "foldmax"：逐格点取各折最大值（最乐观折，2026-08-28 起的口径）—— main 的默认
+# "fold1"  ：只取折 1（一次训练）—— feature/display-single-fold 的默认
+# 环境变量 DISPLAY_MODE 可覆盖默认值：同一份代码能同时起两种口径的站点
+#   DISPLAY_MODE=foldmax python -m uvicorn main:app --port 8002
+# 两者读同一份 Dataset/，进程各持自己的缓存，互不影响。
+# 取值不合法时**直接抛错**，不静默回落到 foldmax——悄悄换口径比报错危险得多。
 # pre7 修复批在 Dataset/pre7-new/，折数补齐中（现 1 折）。详见模块 docstring。
-DISPLAY_MODE = "foldmax"
+DISPLAY_MODE = os.environ.get("DISPLAY_MODE", "foldmax")
+if DISPLAY_MODE not in ("foldmax", "fold1"):
+    raise ValueError(f"DISPLAY_MODE 只能是 'foldmax' 或 'fold1'，收到 {DISPLAY_MODE!r}")
 
 
 class ValidationError(ValueError):

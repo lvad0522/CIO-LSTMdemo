@@ -6,8 +6,10 @@
 """
 
 import io
+import os
 import sys
 import json
+import subprocess
 import urllib.request
 import urllib.error
 
@@ -18,7 +20,10 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import numpy as np
 
-API = "http://localhost:8000"
+# 被测后端地址。**同一份代码可以同时起两种口径的站点**（DISPLAY_MODE 环境变量），
+# 所以地址可用 API_BASE 覆盖，好逐个站点验：
+#   API_BASE=http://127.0.0.1:8001 python test_api.py    # fold1 站点
+API = os.environ.get("API_BASE", "http://localhost:8000")
 passed = 0
 failed = 0
 
@@ -353,6 +358,38 @@ def main():
         g7 = json.loads(resp.read().decode())
     assert len(g7["real"]) == 112 and len(g7["pred"]) == 112
     print(f"  ✓ /api/run 与 /api/grid 对 pre7 正常（table {want7_rows} 行、序列 112 天）")
+    passed += 1
+
+    # ── 13. DISPLAY_MODE 环境变量覆盖（import 期生效，只能起子进程验）──
+    # 覆盖是为了**同一份代码同时起两种口径的站点**（两个后端读同一份 Dataset/）。
+    # 两条分支只差默认值：无 env 时必须等于本分支的默认口径。
+    print("\n[13] DISPLAY_MODE 环境变量覆盖")
+
+    def _mode_with(env_value):
+        """在子进程里 import real_data，返回 (returncode, stdout, stderr)。"""
+        env = dict(os.environ)
+        if env_value is None:
+            env.pop("DISPLAY_MODE", None)
+        else:
+            env["DISPLAY_MODE"] = env_value
+        r = subprocess.run(
+            [sys.executable, "-c", "import real_data; print(real_data.DISPLAY_MODE)"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+        return r.returncode, r.stdout.strip(), r.stderr
+
+    rc, out, err = _mode_with(None)
+    assert rc == 0, f"无 env 时应正常 import，实际 rc={rc}: {err[:200]}"
+    assert out == DISPLAY_MODE, f"无 env 时应用本分支默认口径 {DISPLAY_MODE}, 实际 {out}"
+    for mode in ("foldmax", "fold1"):
+        rc, out, err = _mode_with(mode)
+        assert rc == 0 and out == mode, f"DISPLAY_MODE={mode} 应生效, 实际 rc={rc} out={out!r}"
+    # 非法值必须**报错退出**，不许静默回落（悄悄换口径比报错危险得多）
+    rc, out, err = _mode_with("Fold1")
+    assert rc != 0, f"非法 DISPLAY_MODE 应让进程报错退出, 实际 rc={rc} out={out!r}"
+    assert "DISPLAY_MODE" in err, f"报错信息应点名 DISPLAY_MODE, 实际: {err[-300:]}"
+    print(f"  ✓ 无 env 时用默认 {DISPLAY_MODE}；foldmax/fold1 均可覆盖；非法值报错不回落")
     passed += 1
 
     # ── 汇总 ──
