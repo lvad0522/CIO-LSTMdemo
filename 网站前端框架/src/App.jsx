@@ -55,8 +55,10 @@ export default function App() {
     }
   }, []);
 
-  const handleCioFileChange = useCallback((file) => {
+  const handleCioFileChange = useCallback((file, detectedKind) => {
     setCioFile(file);
+    if (detectedKind) setUploadKind(detectedKind);
+    if (file) setActiveModule('lstm');
     setPredictionJob(null);
     setResults(null);
     setError(null);

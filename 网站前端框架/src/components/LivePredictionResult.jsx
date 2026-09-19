@@ -5,6 +5,10 @@ import {
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
 const CELL_SCALE = 6;
+const GEO_URL = '/geo/east_asia_coastline.json?v=1';
+const MAP_ROWS = 81;
+const MAP_COLS = 101;
+const CONTOUR_LEVEL = 0.5;
 
 const KIND_LABELS = { u850: 'U850 距平场', sst: 'SST', both: 'SST + U850' };
 const KIND_SOURCE_LABELS = { 'explicit-param': '界面指定', filename: '按文件名判定' };
@@ -35,6 +39,164 @@ const VIEW_LABELS = {
   truth: '实况场',
 };
 
+function contourPathD(grid, threshold) {
+  if (!Array.isArray(grid) || !grid.length || !Array.isArray(grid[0])) return '';
+  const rows = grid.length;
+  const cols = grid[0].length;
+  const segments = [];
+
+  const crossing = (a, b) => {
+    if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) return null;
+    const t = (threshold - a) / (b - a);
+    return t > 0 && t < 1 ? t : null;
+  };
+
+  for (let i = 0; i < rows - 1; i += 1) {
+    for (let j = 0; j < cols - 1; j += 1) {
+      const v00 = grid[i][j];
+      const v10 = grid[i][j + 1];
+      const v11 = grid[i + 1][j + 1];
+      const v01 = grid[i + 1][j];
+      const top = crossing(v00, v10);
+      const right = crossing(v10, v11);
+      const bottom = crossing(v01, v11);
+      const left = crossing(v00, v01);
+      const points = [];
+      const yTop = rows - i - 0.5;
+      const yBottom = rows - i - 1.5;
+
+      if (top !== null) points.push(['t', j + 0.5 + top, yTop]);
+      if (right !== null) points.push(['r', j + 1.5, yTop - right]);
+      if (bottom !== null) points.push(['b', j + 0.5 + bottom, yBottom]);
+      if (left !== null) points.push(['l', j + 0.5, yTop - left]);
+
+      if (points.length === 2) {
+        segments.push([points[0], points[1]]);
+      } else if (points.length === 4) {
+        const diagonal = v00 >= threshold && v11 >= threshold;
+        if (diagonal) {
+          segments.push([points[0], points[3]], [points[1], points[2]]);
+        } else {
+          segments.push([points[0], points[1]], [points[2], points[3]]);
+        }
+      }
+    }
+  }
+
+  return segments
+    .map(([a, b]) => `M${a[1].toFixed(2)} ${a[2].toFixed(2)}L${b[1].toFixed(2)} ${b[2].toFixed(2)}`)
+    .join('');
+}
+
+function lonToX(lon, cols) {
+  return ((lon - 100) / 25) * cols;
+}
+
+function latToY(lat, rows) {
+  return rows - ((lat - 20) / 20) * rows;
+}
+
+function geoPathD(segments, cols, rows) {
+  if (!Array.isArray(segments)) return '';
+  return segments
+    .filter(Array.isArray)
+    .map(segment => segment
+      .filter(point => Array.isArray(point) && point.length >= 2)
+      .map(([lon, lat], index) => (
+        `${index === 0 ? 'M' : 'L'}${lonToX(lon, cols).toFixed(2)} ${latToY(lat, rows).toFixed(2)}`
+      ))
+      .join(''))
+    .join('');
+}
+
+function focusBox(rows, cols) {
+  const x = lonToX(112, cols);
+  const right = lonToX(121, cols);
+  const y = latToY(27, rows);
+  const bottom = latToY(23, rows);
+  return { x, y, width: right - x, height: bottom - y };
+}
+
+function GeoHeatmapFrame({ children, data, rows, cols, geoData, selectedPoint = null }) {
+  const box = focusBox(rows, cols);
+  return (
+    <div className="prediction-map-shell">
+      <div className="map-body">
+        <div className="lat-axis" aria-hidden="true">
+          {[40, 35, 30, 25, 20].map(lat => (
+            <span
+              key={lat}
+              className={lat === 20 ? 'bottom' : ''}
+              style={lat === 20 ? undefined : { top: `${((40 - lat) / 20) * 100}%` }}
+            >{lat}°N</span>
+          ))}
+          <span className="lat-title">纬度 (°N)</span>
+        </div>
+        <div className="prediction-canvas-wrap prediction-map-surface">
+          {children}
+          <svg
+            className="heatmap-overlay"
+            viewBox={`0 0 ${cols} ${rows}`}
+            preserveAspectRatio="none"
+            aria-hidden="true"
+          >
+            {geoData && (
+              <path
+                d={geoPathD(geoData.coast || [], cols, rows)}
+                fill="none"
+                stroke="#222"
+                strokeWidth={1.2}
+                opacity={0.9}
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+            <path
+              d={contourPathD(data, CONTOUR_LEVEL)}
+              fill="none"
+              stroke="#000"
+              strokeWidth={1.6}
+              opacity={0.95}
+              vectorEffect="non-scaling-stroke"
+            />
+            <rect
+              x={box.x}
+              y={box.y}
+              width={box.width}
+              height={box.height}
+              fill="none"
+              stroke="#0057b8"
+              strokeWidth={1.5}
+              vectorEffect="non-scaling-stroke"
+            />
+            {selectedPoint && (
+              <rect
+                x={selectedPoint.j}
+                y={rows - 1 - selectedPoint.i}
+                width={1}
+                height={1}
+                fill="none"
+                stroke="#111"
+                strokeWidth={2}
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+          </svg>
+        </div>
+      </div>
+      <div className="lon-axis" aria-hidden="true">
+        {[100, 105, 110, 115, 120, 125].map(lon => (
+          <span key={lon} style={{ left: `${((lon - 100) / 25) * 100}%` }}>{lon}°E</span>
+        ))}
+        <span className="lon-title">经度 (°E)</span>
+      </div>
+      <div className="geo-overlay-key">
+        <span className="geo-key-line geo-key-contour" />0.5 等值线
+        <span className="geo-key-line geo-key-focus" />重点区域（112–121°E，23–27°N）
+      </div>
+    </div>
+  );
+}
+
 export default function LivePredictionResult({ job, confidence = '0.95' }) {
   const [timeIndex, setTimeIndex] = useState(0);
   const [frame, setFrame] = useState(null);
@@ -42,12 +204,28 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
   const [selectedGrid, setSelectedGrid] = useState({ i: 40, j: 50 });
   const [gridSeries, setGridSeries] = useState(null);
   const [pearson, setPearson] = useState(null);
+  const [selectedPearsonGrid, setSelectedPearsonGrid] = useState(null);
+  const [geoData, setGeoData] = useState(null);
   const [error, setError] = useState(null);
   const canvasRef = useRef(null);
   const rCanvasRef = useRef(null);
 
   const verification = job.result?.verification;
   const pearsonAvailable = Boolean(verification?.available);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch(GEO_URL, { signal: controller.signal })
+      .then(response => {
+        if (!response.ok) throw new Error(`海岸线读取失败 (${response.status})`);
+        return response.json();
+      })
+      .then(setGeoData)
+      .catch(err => {
+        if (err.name !== 'AbortError') setError(err.message);
+      });
+    return () => controller.abort();
+  }, []);
 
   // 预测场 / 实况场共用同一套画布与坐标，只是数据源不同
   useEffect(() => {
@@ -114,14 +292,19 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
     frame.data.forEach((row, i) => {
       row.forEach((value, j) => {
         ctx.fillStyle = precipColor(value, maxAbs);
-        ctx.fillRect(j * CELL_SCALE, i * CELL_SCALE, CELL_SCALE, CELL_SCALE);
+        ctx.fillRect(
+          j * CELL_SCALE,
+          (frame.rows - 1 - i) * CELL_SCALE,
+          CELL_SCALE,
+          CELL_SCALE,
+        );
       });
     });
     ctx.strokeStyle = '#111';
     ctx.lineWidth = 1;
     ctx.strokeRect(
       selectedGrid.j * CELL_SCALE + 0.5,
-      selectedGrid.i * CELL_SCALE + 0.5,
+      (frame.rows - 1 - selectedGrid.i) * CELL_SCALE + 0.5,
       CELL_SCALE - 1,
       CELL_SCALE - 1,
     );
@@ -139,7 +322,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
     pearson.data.forEach((row, i) => {
       row.forEach((value, j) => {
         const x = j * CELL_SCALE;
-        const y = i * CELL_SCALE;
+        const y = (pearson.rows - 1 - i) * CELL_SCALE;
         if (value === null || !Number.isFinite(value)) {
           ctx.fillStyle = '#2b2b2b';            // 无定义（时间维恒定）
         } else {
@@ -160,7 +343,27 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
     if (!frame) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const j = Math.min(frame.cols - 1, Math.floor((event.clientX - rect.left) / rect.width * frame.cols));
-    const i = Math.min(frame.rows - 1, Math.floor((event.clientY - rect.top) / rect.height * frame.rows));
+    const displayRow = Math.min(
+      frame.rows - 1,
+      Math.floor((event.clientY - rect.top) / rect.height * frame.rows),
+    );
+    const i = frame.rows - 1 - displayRow;
+    setSelectedGrid({ i, j });
+  };
+
+  const handlePearsonCanvasClick = (event) => {
+    if (!pearson) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const j = Math.min(
+      pearson.cols - 1,
+      Math.floor((event.clientX - rect.left) / rect.width * pearson.cols),
+    );
+    const displayRow = Math.min(
+      pearson.rows - 1,
+      Math.floor((event.clientY - rect.top) / rect.height * pearson.rows),
+    );
+    const i = pearson.rows - 1 - displayRow;
+    setSelectedPearsonGrid({ i, j });
     setSelectedGrid({ i, j });
   };
 
@@ -237,14 +440,19 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
                 所以并排看时颜色深浅不能直接对比，只能比空间形态；定量比较看下方的相关系数图。
               </p>
             ) : null}
-            <div className="prediction-canvas-wrap">
+            <GeoHeatmapFrame
+              data={frame?.data}
+              rows={frame?.rows || MAP_ROWS}
+              cols={frame?.cols || MAP_COLS}
+              geoData={geoData}
+            >
               <canvas
                 ref={canvasRef}
                 className="prediction-canvas"
                 onClick={handleCanvasClick}
                 title="点击格点查看预测时序"
               />
-            </div>
+            </GeoHeatmapFrame>
             <div className="prediction-legend">
               <span>负距平</span><div className="prediction-gradient" /><span>正距平</span>
             </div>
@@ -341,13 +549,41 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
                   ? `每个格点沿 112 天算一个 r · 通过 ${(pearson.confidence * 100).toFixed(0)}% 显著性需 |r| ≥ ${pearson.criticalR}`
                   : '正在计算相关系数'}
               </p>
-              <div className="prediction-canvas-wrap">
+              <GeoHeatmapFrame
+                data={pearson?.data}
+                rows={pearson?.rows || MAP_ROWS}
+                cols={pearson?.cols || MAP_COLS}
+                geoData={geoData}
+                selectedPoint={selectedPearsonGrid}
+              >
                 <canvas
                   ref={rCanvasRef}
                   className="prediction-canvas"
+                  onClick={handlePearsonCanvasClick}
                   title="灰色 = 未通过显著性检验；深灰 = 该格点预测恒定、r 无定义"
                 />
-              </div>
+              </GeoHeatmapFrame>
+              {selectedPearsonGrid && pearson && (() => {
+                const { i, j } = selectedPearsonGrid;
+                const value = pearson.data?.[i]?.[j];
+                const lon = 100 + (j * 25) / Math.max(pearson.cols - 1, 1);
+                const lat = 20 + (i * 20) / Math.max(pearson.rows - 1, 1);
+                const finite = Number.isFinite(value);
+                const significant = finite && Math.abs(value) >= pearson.criticalR;
+                return (
+                  <div className="pearson-point-readout" role="status">
+                    <span>已选格点</span>
+                    <strong>{lon.toFixed(2)}°E，{lat.toFixed(2)}°N</strong>
+                    <span>Pearson 系数</span>
+                    <strong>{finite ? `r = ${value.toFixed(4)}` : 'r 无定义'}</strong>
+                    <span className={`pearson-point-status ${significant ? 'is-significant' : ''}`}>
+                      {finite
+                        ? (significant ? '达到当前显著性阈值' : '未达到当前显著性阈值')
+                        : '该格点序列恒定'}
+                    </span>
+                  </div>
+                );
+              })()}
               <div className="prediction-legend">
                 <span>r = -1</span>
                 <div className="prediction-gradient" />

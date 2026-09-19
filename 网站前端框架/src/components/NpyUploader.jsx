@@ -35,13 +35,19 @@ export default function NpyUploader({ kind = 'npy', file, onFileChange, disabled
 
   const selectFile = (nextFile) => {
     if (!nextFile) return;
-    if (!nextFile.name.toLowerCase().endsWith(config.ext)) {
-      setError(config.badType);
+    const lowerName = nextFile.name.toLowerCase();
+    const detectedKind = lowerName.endsWith('.npy')
+      ? 'npy'
+      : lowerName.endsWith('.zip')
+        ? 'zip'
+        : null;
+    if (!detectedKind) {
+      setError('仅支持 CIO .npy 或原始气象场 .zip 文件');
       onFileChange?.(null);
       return;
     }
     setError(null);
-    onFileChange?.(nextFile);
+    onFileChange?.(nextFile, detectedKind);
   };
 
   return (
@@ -61,7 +67,7 @@ export default function NpyUploader({ kind = 'npy', file, onFileChange, disabled
         <input
           ref={inputRef}
           type="file"
-          accept={config.ext}
+          accept=".npy,.zip"
           hidden
           disabled={disabled}
           onChange={(e) => selectFile(e.target.files?.[0])}

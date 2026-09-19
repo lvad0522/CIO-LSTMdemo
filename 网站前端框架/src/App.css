@@ -409,13 +409,61 @@
   border-radius: 6px;
   background: #f7f8fa;
 }
+.prediction-map-shell { width: 100%; }
+.prediction-map-surface {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+.prediction-map-surface .heatmap-overlay { z-index: 2; }
+.geo-overlay-key {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 5px 8px;
+  min-height: 20px;
+  margin-top: 2px;
+  color: #777;
+  font-size: 10px;
+}
+.geo-key-line {
+  display: inline-block;
+  width: 22px;
+  height: 0;
+  border-top: 2px solid;
+}
+.geo-key-contour { border-color: #000; }
+.geo-key-focus { border-color: #0057b8; }
 .prediction-canvas {
   display: block;
   width: 100%;
   height: auto;
   image-rendering: pixelated;
-  cursor: crosshair;
+  cursor: default;
 }
+.pearson-point-readout {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: center;
+  gap: 6px 10px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid #cfdce2;
+  border-radius: 5px;
+  background: #f8fbfc;
+  color: #65747b;
+  font-size: 11px;
+}
+.pearson-point-readout strong {
+  color: #244f60;
+  font-variant-numeric: tabular-nums;
+}
+.pearson-point-status {
+  justify-self: end;
+  color: #8b6b2d;
+}
+.pearson-point-status.is-significant { color: #25735d; }
 .prediction-legend {
   display: flex;
   align-items: center;
