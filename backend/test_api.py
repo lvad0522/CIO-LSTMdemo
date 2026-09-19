@@ -379,9 +379,15 @@ def main():
         )
         return r.returncode, r.stdout.strip(), r.stderr
 
+    # 无 env 时必须回落到**本分支的默认口径**。但若调用方自己在 shell 里设了
+    # DISPLAY_MODE（例如 `DISPLAY_MODE=fold1 API_BASE=... python test_api.py`
+    # 去验 fold1 站点），那 DISPLAY_MODE 已是**覆盖值**、不再是分支默认值，
+    # 子进程（剥掉 env）看到的仍是分支默认 —— 两者本就不同，这时跳过这条判据。
     rc, out, err = _mode_with(None)
     assert rc == 0, f"无 env 时应正常 import，实际 rc={rc}: {err[:200]}"
-    assert out == DISPLAY_MODE, f"无 env 时应用本分支默认口径 {DISPLAY_MODE}, 实际 {out}"
+    assert out in ("foldmax", "fold1"), f"无 env 时口径应合法, 实际 {out!r}"
+    if "DISPLAY_MODE" not in os.environ:
+        assert out == DISPLAY_MODE, f"无 env 时应用本分支默认口径 {DISPLAY_MODE}, 实际 {out}"
     for mode in ("foldmax", "fold1"):
         rc, out, err = _mode_with(mode)
         assert rc == 0 and out == mode, f"DISPLAY_MODE={mode} 应生效, 实际 rc={rc} out={out!r}"
@@ -389,7 +395,8 @@ def main():
     rc, out, err = _mode_with("Fold1")
     assert rc != 0, f"非法 DISPLAY_MODE 应让进程报错退出, 实际 rc={rc} out={out!r}"
     assert "DISPLAY_MODE" in err, f"报错信息应点名 DISPLAY_MODE, 实际: {err[-300:]}"
-    print(f"  ✓ 无 env 时用默认 {DISPLAY_MODE}；foldmax/fold1 均可覆盖；非法值报错不回落")
+    _src = "本分支默认" if "DISPLAY_MODE" not in os.environ else f"shell 覆盖为 {DISPLAY_MODE}"
+    print(f"  ✓ 无 env 时回落到分支默认；foldmax/fold1 可覆盖（当前{_src}）；非法值报错不回落")
     passed += 1
 
     # ── 汇总 ──
