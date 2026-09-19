@@ -240,12 +240,16 @@ def main():
     print("\n[11] 数据集完整性校验")
     import real_data
     v = real_data.verify_dataset()
-    # 2026-09-19：pre7 换成 model/pre7_单折/ 的单折重训件，期望由 7200 降为 6900
-    # （= 19 lead × 20 年 × 6 折 × 3 + pre7 20 年 × 1 折 × 3）
-    assert v["total_expected"] == 6900, f"期望 6900 文件, 实际 {v['total_expected']}"
+    # 期望文件数按**实际折数**实算，不写死：19 个 lead 恒 6 折，pre7 是修复批
+    # （Dataset/pre7-new/），折 2~6 补齐中，补齐后本式自动跟着涨，无需改测试。
+    # 见 摸库交付_2026-09-15/04_文档/pre7六折落位_给后端agent.md
+    _pre7_folds = len(real_data._folds(7, 2000, "pearson2"))
+    want_total = 19 * 20 * 6 * 3 + _pre7_folds * 20 * 3
+    assert v["total_expected"] == want_total, \
+        f"期望 {want_total} 文件（pre7 {_pre7_folds} 折）, 实际 {v['total_expected']}"
     assert len(v["missing"]) == 0, f"期望 0 缺失（pre19/2002 已填补）, 实际 {len(v['missing'])}"
     assert v["malformed"] == 300, f"期望 300 个意外文件, 实际 {v['malformed']}"
-    print("  ✓ verify_dataset: 6900 期望 / 0 缺失（pre19/2002 real2 已填补）/ 300 畸形冗余")
+    print(f"  ✓ verify_dataset: {want_total} 期望（pre7 {_pre7_folds} 折）/ 0 缺失 / 300 畸形冗余")
     passed += 1
     # 口径修复（2026-09-17）：那 50 个目录的 pearson2 由"第二遍"的截断名 predict2 算出，
     # 故 predict2 优先解析到截断名（保证热力图 r 与曲线同源）；real2 与干净目录不变。
@@ -264,18 +268,26 @@ def main():
     print("  ✓ 口径修复：脏目录 predict2 取截断名 / real2 与干净目录不变，加载无 NaN")
     passed += 1
 
-    # pre7 单折（2026-09-19 接入 model/pre7_单折/，数据不再走 Dataset/pre7）
-    # 折号不再写死：pre7 只有折 1，其余 lead 仍 6 折。见
-    # 摸库交付_2026-09-15/04_文档/pre7单折与显示口径_给后端agent.md 第二节
-    assert real_data._folds(7, 2000) == [1], \
-        f"pre7 应只有折 1, 实际 {real_data._folds(7, 2000)}"
+    # pre7 修复批（2026-09-19 落 Dataset/pre7-new/，坏批 Dataset/pre7/ 不再被读）
+    # 折数**不写死**：折 2~6 自跑重复实验补齐中（现 1 折），落齐后本块无需改动。
+    # 见 摸库交付_2026-09-15/04_文档/pre7六折落位_给后端agent.md
+    f7 = real_data._folds(7, 2000)
+    assert f7, "pre7 应有折"
+    assert 1 in f7, f"pre7 必须有折 1（fold1 口径依赖它）, 实际 {f7}"
+    assert f7 == sorted(f7), f"折号应升序, 实际 {f7}"
+    assert real_data._year_dir(7, 2000).replace("\\", "/").endswith("Dataset/pre7-new/2000"), \
+        f"pre7 应读 Dataset/pre7-new/, 实际 {real_data._year_dir(7, 2000)}"
     assert real_data._folds(6, 2000) == [1, 2, 3, 4, 5, 6], "pre6 应仍是 6 折"
     assert real_data._folds(3, 2000, "predict2") == [1, 2, 3, 4, 5, 6], \
         "脏目录的截断名不应被算成折号"
-    assert len(real_data.gen_results_table(2000, 7)) == 1, "pre7 table 应只有 1 行"
+    # 旧坏批一个字节都不许被读：pre7 的解析路径不得落在 Dataset/pre7/ 下
+    assert "Dataset/pre7/" not in real_data._file_path(7, 2000, 1, "pearson2").replace("\\", "/"), \
+        "pre7 不得再读坏批 Dataset/pre7/"
+    assert len(real_data.gen_results_table(2000, 7)) == len(f7), "pre7 table 行数应等于折数"
     assert real_data.gen_skill_map(2000, 7)["rows"] == 81
     assert len(real_data.gen_time_series(2000, 7, 40, 50)["real"]) == 112
-    print("  ✓ pre7 单折：_folds(7,2000)=[1]，skillMap/timeSeries/table 均不抛 DataNotFoundError")
+    print(f"  ✓ pre7 修复批：_folds(7,2000)={f7}，读 Dataset/pre7-new/，"
+          f"skillMap/timeSeries/table 均不抛 DataNotFoundError")
     passed += 1
 
     # 展示口径（real_data.DISPLAY_MODE）：main=foldmax（各折逐格点取最大）/
@@ -328,16 +340,19 @@ def main():
     print("  ✓ _display_folds 守卫：展示折 ⊆ 实有折；fold1 缺折 1 报错不静默换折")
     passed += 1
 
-    # ── 12. pre7 单折走 HTTP ──
-    print("\n[12] pre7 单折（HTTP）")
+    # ── 12. pre7 走 HTTP ──
+    print("\n[12] pre7 修复批（HTTP）")
     with urllib.request.urlopen(f"{API}/api/run?year=2000&lead=pre7", timeout=30) as resp:
         run7 = json.loads(resp.read().decode())
-    assert len(run7["table"]) == 1, f"pre7 table 应 1 行, 实际 {len(run7['table'])}"
+    # 行数按当前口径与**实际折数**算，不写死（pre7 折数补齐中）
+    want7_rows = 1 if DISPLAY_MODE == "fold1" else len(f7)
+    assert len(run7["table"]) == want7_rows, \
+        f"pre7 table 应 {want7_rows} 行（口径 {DISPLAY_MODE}, pre7 {len(f7)} 折）, 实际 {len(run7['table'])}"
     assert run7["skillMap"]["rows"] == 81 and run7["skillMap"]["cols"] == 101
     with urllib.request.urlopen(f"{API}/api/grid?i=40&j=50&year=2000&lead=pre7", timeout=30) as resp:
         g7 = json.loads(resp.read().decode())
     assert len(g7["real"]) == 112 and len(g7["pred"]) == 112
-    print("  ✓ /api/run 与 /api/grid 对 pre7 正常（table 1 行、序列 112 天）")
+    print(f"  ✓ /api/run 与 /api/grid 对 pre7 正常（table {want7_rows} 行、序列 112 天）")
     passed += 1
 
     # ── 汇总 ──

@@ -1,4 +1,4 @@
-"""真实数据加载模块 —— 加载 CIO+LSTM 降水预测的真实输出（Dataset/ + 重训产出的 model/）。
+"""真实数据加载模块 —— 加载 CIO+LSTM 降水预测的真实输出（全部在 Dataset/ 下）。
 
 数据源约定
 ==========
@@ -6,14 +6,15 @@
   `pre_{lead}_{year}({fold})_20_40_100_125_0.25_{type}2.npy`
   - lead: 提前期 1-20（pre1~pre20）
   - year: 2000-2019
-  - fold: 1-6（LSTM 重复实验）；**pre7 重训后只有 1**，折数一律用 `_folds()` 实查。
+  - fold: 1-6（LSTM 重复实验）；**pre7 修复批折数会变动**（现 1 折，补齐中），
+    折数一律用 `_folds()` 实查，**任何地方都不许写死**。
     展示用哪几折由 `DISPLAY_MODE` 决定（foldmax=各折取最大 / fold1=只折 1）
   - type: pearson2 / predict2 / real2
 - 区域：东亚 20-40°N, 100-125°E @0.25°，网格 81×101（GRID_ROWS×GRID_COLS）
 - 时间：112 天（6-9 月每月 2-29 号）
 - 数据根目录：默认 `../Dataset`（相对 backend 目录），可用环境变量 `DATA_ROOT` 覆盖
-- 重训 lead 改指 `{MODEL_ROOT}/`（默认 `../model`，环境变量 `MODEL_ROOT` 覆盖），
-  逐 lead 登记在 `LEAD_DATA_DIRS`（含是否平铺），见 `_year_dir()`
+- 个别 lead 的落点在本模块 `LEAD_DATA_DIRS` 里逐 lead 登记（含是否按年份分子目录），
+  见 `_year_dir()`。**`model/` 不是数据源**——那里只放用户自己训练的 .pt 模型本体
 
 文件语义（源自 main_India_new.py，见 gen_guide.py:711-810）
 - pearson2: 形状 (81,101,3) = [行索引, 列索引, Pearson r]（第 3 通道才是 r）
@@ -21,13 +22,16 @@
 - real2:   形状 (81,101,112) float64，真实滤波后降水（带通滤波，58% 负值）
 - pearson 中的 NaN 已被生成脚本替换为 0（0 可能是"无有效相关"而非真实 r=0）
 
-已知数据情况（2026-08-25 实测；命名口径 2026-09-17 修订；pre7 2026-09-19 接新件）
-- **旧 pre7 是坏模型**（输入是常数垃圾场，输出年不变、r 虚高）：论文口径跨 20 年平均
-  0.1534，其余 19 个 lead 只有 0.1240~0.1287。2026-09-19 起改用重训批次——干净输入、
-  20 年平均 +0.1274，落在健康区间。**新件在 `model/pre7_单折/`，且只有折 1**，由
-  `_year_dir()` 接手；`Dataset/pre7/` 那 360 个旧件原封未动（不删不改，留作对照）。
-  显示口径 2026-09-19 已拍板为**全站只用折 1**（见下"统计口径说明"）——单折的 pre7
-  与 6 折的邻居只有在这个口径下才可比
+已知数据情况（2026-08-25 实测；命名口径 2026-09-17 修订；pre7 2026-09-19 换修复批）
+- **`Dataset/pre7/` 是坏批**：那 360 个文件（20 年 × 6 折 × 3）用的 CIO 输入是常数垃圾场
+  （99.32% 元素跨年块逐字节相同），模型退化、r 虚高（2000 年 0.2204，隔壁 pre6/pre8 只 0.14 上下）。
+  **原封不动留着作对照，网站不读它**
+- **pre7 修复批落 `Dataset/pre7-new/{year}/`**，目录结构与命名同 `Dataset/pre1..pre20`。
+  折 1（2026-09-16 用干净输入重训）**已就位**，与它搬过来之前的 `model/pre7_单折/` **逐字节一致**；
+  折 2~6 是自跑的 5 次重复实验（2026-09-19 起，20 进程 × 四块 3090），陆续落齐中。
+  来历见该目录下 `README.md`（人读）+ `PROVENANCE.json`（机读，含每折 runner/origin/date）
+- 折数**不写死**：pre7 现为 1 折、补齐后 6 折，一律 `_folds()` 实查。
+  显示口径 2026-09-19 已拍板为**全站只用折 1**（见下"统计口径说明"）——该口径与折数多少无关
 - pre19/2002 的 6 个 real2 原缺失，已用 pre1/2002 同 fold 复制填补
   （2002 年 real2 跨 pre1~pre20 逐字节一致——真实值不依赖 lead；pearson2 随 lead 变化，勿同法处理）
   [2026-09-19 复核：填补件与 pre1/2002 同 fold 逐字节一致，且 mtime 秒级继承自 pre1/2002
@@ -47,9 +51,12 @@ source 标记约定
 - 两个展示口径，两条分支的代码除该常量外完全一致（见 `_display_folds()`）：
   - `"foldmax"`（**main**，2026-08-28 起）：逐格点取各折最大值（最乐观折）
   - `"fold1"`（**feature/display-single-fold**）：只取折 1（一次训练）
-- **为什么要有 fold1**：pre7 重训件只有折 1，"折最大"对它等于它自己，与邻居 6 折取最大
-  不可比（2003 年 S2S 蓝框：pre7 0.3410 而邻居 ~0.50，看着像 pre7 最差）；统一折 1 后
-  pre7 0.3410 落在邻居 0.32~0.38 区间内。代价：单折单格点噪声大、可为负
+- **为什么要有 fold1**：只有折 1 对应**一次真实训练**——foldmax 是逐格点挑最乐观折、
+  foldmean 也不是任何一次训练的结果，两者都不是任何模型的能力。2026-09-19 引入时还有个
+  直接动因：当时 pre7 只有折 1，"折最大"对它等于它自己，与邻居 6 折取最大不可比
+  （2003 年 S2S 蓝框：pre7 0.3410 而邻居 ~0.50，看着像 pre7 最差）；统一折 1 后
+  pre7 0.3410 落在邻居 0.32~0.38 区间内。**该动因随 pre7 补齐 6 折而消失，但决定不变**
+  ——选择的依据是"一次真实训练"这条原则，与折数多少无关。代价：单折单格点噪声大、可为负
   （2000 年 pre6 @(40,50) = 0.0102），这是折 1 的真实水平
 - **为什么 main 仍留 foldmax**：foldmax 不是任何一次训练的能力，实测把全网格平均放大
   约 2.2~3.7 倍（2000 年 0.15 → 0.36）。保留它只为对照，对外口径以 fold1 分支为准
@@ -73,20 +80,19 @@ import numpy as np
 # ── 路径与常量 ────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.environ.get("DATA_ROOT", os.path.join(_HERE, "..", "Dataset"))
-# 模型侧产出根目录（2026-09-19 规矩：用 .pt 跑出来的东西放 model/，不往 Dataset/ 塞）
-MODEL_ROOT = os.environ.get("MODEL_ROOT", os.path.join(_HERE, "..", "model"))
-
-# 数据目录逐 lead 解析：默认 Dataset/pre{lead}/{year}/；重训过的 lead 在此登记，
-# 值为 (根目录, 是否平铺)。Dataset/ 按年份分子目录，model/ 下的重训产出平铺一层
-# （年份已编码在文件名里）。加新条目即可，其余代码不用动。见 model/README.md 与
-# 摸库交付_2026-09-15/04_文档/pre7单折与显示口径_给后端agent.md
+# 数据目录逐 lead 解析：默认 Dataset/pre{lead}/{year}/；落点不同的 lead 在此登记，
+# 值为 (根目录, 是否平铺)。Dataset/ 按年份分子目录；平铺指文件全在一层、年份只编在
+# 文件名里。加新条目即可，其余代码不用动。见 摸库交付_2026-09-15/04_文档/
+# pre7六折落位_给后端agent.md
 LEAD_DATA_DIRS = {
-    7: (os.path.join(MODEL_ROOT, "pre7_单折"), True),   # 09-16 用干净输入重训，仅折 1
+    # 2026-09-19：pre7 修复批落 Dataset/pre7-new/，结构与 Dataset/pre1..pre20 一致
+    # （按年份分子目录）。坏批 Dataset/pre7/ 的 360 个旧件留着作对照，不再被读
+    7: (os.path.join(DATA_ROOT, "pre7-new"), False),
 }
 
 
 def _year_dir(lead, year):
-    """该 (lead, year) 的文件所在目录（Dataset/ 是 pre{lead}/{year}/，重训产出是平铺）。"""
+    """该 (lead, year) 的文件所在目录（默认 Dataset/pre{lead}/{year}/，可按 lead 覆盖）。"""
     spec = LEAD_DATA_DIRS.get(lead)
     if spec is None:
         return os.path.join(DATA_ROOT, f"pre{lead}", str(year))
@@ -101,18 +107,18 @@ FILE_PATTERN = re.compile(
 GRID_ROWS = 81
 GRID_COLS = 101
 N_DAYS = 112
-# 重复次数（"折"）不写死：多数 lead 是 6，pre7 重训后只有 1。一律用 _folds() 实查
+# 重复次数（"折"）不写死：多数 lead 是 6，pre7 修复批补齐中（现 1 折）。一律用 _folds() 实查
 LEADS = list(range(1, 21))
 YEARS = list(range(2000, 2020))
 
-# 数据完整性：2026-09-19 起期望 6900 个文件（= 19 个 lead × 20 年 × 6 折 × 3 + pre7 的
-# 20 年 × 1 折 × 3）。pre19/2002 的 6 个 real2 曾缺失，已用 pre1/2002 同 fold 复制填补；
-# pre7 换成 model/ 下的单折重训件，见模块 docstring
+# 数据完整性：期望文件数按**实际折数**实算，不写死。现为 6900（= 19 个 lead × 20 年 × 6 折 × 3
+# + pre7 的 20 年 × 1 折 × 3），pre7 折 2~6 落齐后回到 7200。pre19/2002 的 6 个 real2 曾缺失，
+# 已用 pre1/2002 同 fold 复制填补。见模块 docstring
 
 # ── 展示口径（**两条分支只差这一个常量**）────────────────
 # "foldmax"：逐格点取各折最大值（最乐观折，2026-08-28 起的口径）—— main 分支
 # "fold1"  ：只取折 1（一次训练）—— feature/display-single-fold 分支
-# pre7 重训件只有折 1，只有 fold1 口径下它与邻居才可比。详见模块 docstring。
+# pre7 修复批在 Dataset/pre7-new/，折数补齐中（现 1 折）。详见模块 docstring。
 DISPLAY_MODE = "foldmax"
 
 
@@ -174,8 +180,9 @@ def _file_path(lead, year, fold, kind):
 
 
 def _folds(lead, year, kind="pearson2"):
-    """该 (lead, year) 目录下**实际存在**的折号（升序）。pre7 重训后只有 [1]。
+    """该 (lead, year) 目录下**实际存在**的折号（升序）。
 
+    折数不写死：多数 lead 是 6，pre7 修复批补齐中（现 1 折）。
     只认正常名（带括号）：截断名 `pre_3_20001)_...` 不匹配 FILE_PATTERN，自然被排除，
     所以不需要额外正则。用 os.listdir + 正则而非 glob 通配。
     """
@@ -270,9 +277,9 @@ def _check_grid(i, j):
 def verify_dataset():
     """按**实际存在**的折逐一检查，返回缺失清单与意外文件统计。
 
-    折号不写死：以该目录 pearson2 的折集为准（pre7 重训后只有 [1]），再查 predict2 /
-    real2 是否按同一批折配套齐全。整目录查不到 pearson2 也记一笔，避免"没有折 ⇒ 无需
-    检查"的空转（若只按实有折循环，missing 会恒为空，校验就废了）。
+    折号不写死：以该目录 pearson2 的折集为准（多数 lead 是 6，pre7 修复批补齐中），
+    再查 predict2 / real2 是否按同一批折配套齐全。整目录查不到 pearson2 也记一笔，
+    避免"没有折 ⇒ 无需检查"的空转（若只按实有折循环，missing 会恒为空，校验就废了）。
 
     返回: {"missing": list[str], "malformed": int, "total_expected": int}
     """
@@ -403,9 +410,9 @@ def _load_s2s_curves():
 def _recompute_lstm_curve():
     """重算 LSTM 20 个 lead 的蓝框区域平均 r（缺折的 lead 返回 None 断线）。
 
-    口径与热力图一致（同走 `_display_pearson`）。foldmax 口径下邻居 ~0.50 而
-    pre7（单折，取最大等于它自己）0.3410 显得最低；fold1 口径下 pre7 落在
-    邻居 0.32~0.38 内 —— 这就是引入 fold1 的直接原因。
+    口径与热力图一致（同走 `_display_pearson`）。引入 fold1 时的直接观察：foldmax 口径下
+    邻居 ~0.50 而 pre7（当时单折，取最大等于它自己）0.3410 显得最低；fold1 口径下 pre7
+    落在邻居 0.32~0.38 内。pre7 补齐 6 折后这个落差会消失，但口径决定不变（见模块 docstring）。
     """
     curve = []
     for lead in S2S_LEADS:
