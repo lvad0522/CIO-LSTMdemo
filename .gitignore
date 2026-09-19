@@ -20,3 +20,6 @@ __pycache__/
 *.log
 uploads/
 *.egg-info/
+
+# ---- 实验资产（实验室数据，不入库；来源见 backend/assets/README.md）----
+backend/assets/*.mat

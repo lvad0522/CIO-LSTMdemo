@@ -29,8 +29,10 @@ from real_data import (
     gen_s2s_comparison,
     gen_results_table,
 )
+from live_prediction import router as live_prediction_router
 
 app = FastAPI(title="CIO+LSTM 降水预测 API")
+app.include_router(live_prediction_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -138,7 +140,12 @@ def s2s_comparison():
 
 @app.post("/api/upload")
 async def upload_data(file: UploadFile = File(...)):
-    """接收用户上传的 .npy 数据文件，保存到 backend/uploads/ 并返回数组摘要。"""
+    """遗留端点：只把 .npy 存到 backend/uploads/ 并回一个数组摘要，不跑任何模型。
+
+    真正的上传推理链路在 `live_prediction.py` 的 `POST /api/predict/jobs`
+    （受理 CIO `.npy` 与原始场 `.zip`，走投影 + 8181 个 checkpoint 前向）。
+    本端点前端已不再调用，保留仅为兼容旧脚本。
+    """
     if not file.filename or not file.filename.lower().endswith(".npy"):
         raise HTTPException(400, "仅支持 .npy 文件")
     content = await file.read()
