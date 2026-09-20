@@ -7,6 +7,7 @@ const CONFIG = {
     badType: '仅支持 .npy 文件（一维 projected CIO 序列）',
     contract: (
       <>
+        <strong>整条链只需上传一次</strong>：这个文件会一路供到降水推理，中途不再要求重选。
         接受长度 <strong>2352</strong>（官方 21 年 × 112）或 <strong>2240</strong>（训练长度）
         的一维 projected CIO 序列，两者都按训练口径「切前 2240 点 → 整段 min-max → 取首年 112 点」。
         更短的序列（≥112 点，例如缺月份的真实件）按整段自归一化并给出警告。
@@ -19,7 +20,8 @@ const CONFIG = {
     badType: '仅支持 .zip 文件（打包的原始气象场）',
     contract: (
       <>
-        打包 <strong>5–9 月逐日原始场 nc</strong>（每个文件只含 2–29 日，28 天/月；
+        <strong>整条链只需上传一次</strong>（投影 → 归一化 → 降水推理都用这一份）。
+        打包 <strong>2000–2020 年 5–9 月逐日原始场 nc</strong>（每个文件只含 2–29 日，28 天/月；
         21 年 × 5 月 = 105 个），上传后由后端现场投影为 CIO。
         文件名需含 <code>u850</code> / <code>uwnd</code> 关键字；zip 里必须含 2000 年。
       </>
@@ -78,7 +80,7 @@ export default function NpyUploader({ kind = 'npy', file, onFileChange, disabled
         <div className="upload-result">
           <span className="upload-ok">✓ {file.name}</span>
           <span className="param-hint">
-            {(file.size / 1024 / 1024).toFixed(2)} MB · 点击“运行”后上传并推理
+            {(file.size / 1024 / 1024).toFixed(2)} MB · 点击“运行”后上传并处理
           </span>
         </div>
       )}

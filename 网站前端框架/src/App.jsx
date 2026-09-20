@@ -1,7 +1,4 @@
-import { useState, useCallback } from 'react';
-import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
-} from 'recharts';
+import { Fragment, useState, useCallback } from 'react';
 import DataSelector from './components/DataSelector';
 import ModuleSelector from './components/ModuleSelector';
 import ParamPanel from './components/ParamPanel';
@@ -10,12 +7,13 @@ import SkillMap from './components/SkillMap';
 import TimeSeriesChart from './components/TimeSeriesChart';
 import ModelCompareChart from './components/ModelCompareChart';
 import ResultsTable from './components/ResultsTable';
-import LivePredictionResult from './components/LivePredictionResult';
 import CioProjectionResult from './components/CioProjectionResult';
+import NormalizationPanel from './components/NormalizationPanel';
+import LivePredictionResult from './components/LivePredictionResult';
 import './App.css';
 
-// 后端地址：默认 8000，可用 VITE_API_BASE 覆盖（如换端口起第二套后端时不改代码）
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
+// 开发期默认走 Vite 同源代理；第二套后端仍可用 VITE_API_BASE 覆盖。
+const API_BASE = import.meta.env.VITE_API_BASE || '';
 
 const defaultParams = {
   cioFilterLow: 0.02,
@@ -27,9 +25,19 @@ const defaultParams = {
   predRegion: 'eastasia',  // 数据集仅支持东亚（20-40°N, 100-125°E）
 };
 
+// 阶段门控只看 stageIndex，不看 status（design D11）：某一段跑完就解锁它的产物区
+const STAGE_PROJECTION = 1;
+const STAGE_NORMALIZATION = 2;
+const STAGE_PREDICTION = 3;
+const STAGE_STEPS = [
+  { n: STAGE_PROJECTION, label: '投影CIO' },
+  { n: STAGE_NORMALIZATION, label: '归一化窗口' },
+  { n: STAGE_PREDICTION, label: 'LSTM降水' },
+];
+
 export default function App() {
   const [dataSource, setDataSource] = useState('default');
-  const [activeModule, setActiveModule] = useState('lstm');
+  const [runScope, setRunScope] = useState('full');   // 'projection' | 'full'
   const [params, setParams] = useState(defaultParams);
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState(null);
@@ -39,7 +47,8 @@ export default function App() {
   const [selectedGrid, setSelectedGrid] = useState({ i: 40, j: 50 });
   const [cioFile, setCioFile] = useState(null);
   const [uploadKind, setUploadKind] = useState('npy');  // 'npy'（CIO 序列）| 'zip'（原始气象场）
-  const [predictionJob, setPredictionJob] = useState(null);
+  // 整条链只有一个任务状态、一次轮询（design D11：上传模式不再有 cioJob/predictionJob）
+  const [chainJob, setChainJob] = useState(null);
 
   const handleParamChange = useCallback((key, value) => {
     setParams(prev => ({ ...prev, [key]: value }));
@@ -48,10 +57,9 @@ export default function App() {
   const handleDataSourceChange = useCallback((nextSource) => {
     setDataSource(nextSource);
     setResults(null);
-    setPredictionJob(null);
+    setChainJob(null);
     setError(null);
     if (nextSource === 'upload') {
-      setActiveModule('lstm');
       setParams(prev => ({ ...prev, predYear: 2000, leadTime: 'pre1' }));
     }
   }, []);
@@ -59,8 +67,7 @@ export default function App() {
   const handleCioFileChange = useCallback((file, detectedKind) => {
     setCioFile(file);
     if (detectedKind) setUploadKind(detectedKind);
-    if (file) setActiveModule('lstm');
-    setPredictionJob(null);
+    setChainJob(null);
     setResults(null);
     setError(null);
   }, []);
@@ -69,7 +76,7 @@ export default function App() {
   const handleUploadKindChange = useCallback((nextKind) => {
     setUploadKind(nextKind);
     setCioFile(null);
-    setPredictionJob(null);
+    setChainJob(null);
     setResults(null);
     setError(null);
   }, []);
@@ -86,36 +93,42 @@ export default function App() {
         }
 
         setResults(null);
-        setPredictionJob({
+        // 整条链 = 一次提交 + 一个任务 + 一个轮询端点；上传件只提交这一次
+        setChainJob({
           status: 'uploading',
           stage: uploadKind === 'zip' ? '正在上传原始气象场' : '正在上传 CIO.npy',
           progress: 0,
+          stageIndex: 0,
         });
         const form = new FormData();
         form.append('file', cioFile);
-        const query = new URLSearchParams({ year: 2000, lead: 'pre1' });
-        // 原始场入口必须显式声明类别（后端会再和文件名对一遍，冲突即报错）
-        if (uploadKind === 'zip') query.set('which', 'u850');
-        const createRes = await fetch(`${API_BASE}/api/predict/jobs?${query}`, {
+        const query = new URLSearchParams({
+          year: '2000',
+          lead: 'pre1',
+          which: uploadKind === 'zip' ? 'u850' : 'cio',
+        });
+        if (runScope === 'projection') query.set('onlyProjection', 'true');
+        const basePath = '/api/chain/jobs';
+        const createRes = await fetch(`${API_BASE}${basePath}?${query}`, {
           method: 'POST',
           body: form,
         });
         const created = await createRes.json();
         if (!createRes.ok) throw new Error(created.detail || `任务创建失败 (${createRes.status})`);
-        setPredictionJob(created);
+        setChainJob(created);
 
         let job = created;
-        for (let attempt = 0; attempt < 1800; attempt += 1) {
+        for (let attempt = 0; attempt < 2700; attempt += 1) {   // 上限 ≥ 30 分钟
           if (job.status === 'completed') break;
-          if (job.status === 'failed') throw new Error(job.error || '模型推理失败');
+          if (job.status === 'failed') throw new Error(job.error || '链路任务失败');
           await new Promise(resolve => setTimeout(resolve, 1000));
-          const statusRes = await fetch(`${API_BASE}/api/predict/jobs/${created.jobId}`);
+          const statusRes = await fetch(`${API_BASE}${basePath}/${created.jobId}`);
           job = await statusRes.json();
           if (!statusRes.ok) throw new Error(job.detail || `进度查询失败 (${statusRes.status})`);
-          setPredictionJob(job);
+          setChainJob(job);
         }
-        if (job.status !== 'completed') throw new Error('模型推理等待超过 30 分钟');
-        setPredictionJob(job);
+        if (job.status !== 'completed') throw new Error('链路任务等待超过 45 分钟');
+        setChainJob(job);
         return;
       }
 
@@ -138,7 +151,7 @@ export default function App() {
     } finally {
       setRunning(false);
     }
-  }, [params, dataSource, cioFile, uploadKind]);
+  }, [params, dataSource, cioFile, uploadKind, runScope]);
 
   const handleGridClick = useCallback(async (i, j, region) => {
     setSelectedGrid({ i, j });
@@ -157,7 +170,28 @@ export default function App() {
     }
   }, [params.predYear, params.leadTime]);
 
-  const cioDisabled = dataSource === 'default';
+  const uploadMode = dataSource === 'upload';
+  const stageIndex = Number(chainJob?.stageIndex ?? 0);
+  const stageStatus = chainJob?.status;
+  const stageInFlight = stageStatus === 'running' || stageStatus === 'queued' || stageStatus === 'uploading';
+  const stageFailed = stageStatus === 'failed';
+  // `.npy` 入口跳过①；只跑投影的完成态下③ 是"本次未运行"而不是"待运行"
+  const stage1Skipped = Boolean(chainJob?.projection?.stage1Skipped);
+  const projectionOnlyDone = stageStatus === 'completed' && stageIndex === STAGE_NORMALIZATION;
+  // 只跑投影时侧栏显示被锁死的投影口径，全链时显示预测口径与置信水平（design D13）
+  const paramModule = uploadMode && runScope === 'projection' ? 'cio' : 'lstm';
+  const stageLabel = (n) => {
+    if (n === STAGE_PROJECTION && stage1Skipped) return '投影CIO（已跳过）';
+    if (n === STAGE_PREDICTION && projectionOnlyDone) return 'LSTM降水（本次未运行）';
+    return STAGE_STEPS[n - 1].label;
+  };
+  const stageState = (n) => {
+    if (stageIndex >= n) return 'done';
+    if (stageFailed) return stageIndex === n - 1 ? 'failed' : 'pending';
+    if (projectionOnlyDone && n === STAGE_PREDICTION) return 'skipped';
+    if (stageInFlight && stageIndex === n - 1) return 'active';
+    return 'pending';
+  };
 
   return (
     <div className="app">
@@ -177,25 +211,21 @@ export default function App() {
           onUploadKindChange={handleUploadKindChange}
         />
 
-        <ModuleSelector
-          active={activeModule}
-          onSelect={setActiveModule}
-          cioDisabled={cioDisabled}
-        />
+        {uploadMode && <ModuleSelector value={runScope} onChange={setRunScope} />}
 
         <ParamPanel
-          module={activeModule}
+          module={paramModule}
           params={params}
           onChange={handleParamChange}
-          liveModelMode={dataSource === 'upload'}
+          liveModelMode={uploadMode}
         />
 
         <RunButton
           onRun={handleRun}
           running={running}
-          disabled={dataSource === 'upload' && !cioFile}
-          progress={predictionJob?.progress || 0}
-          stage={predictionJob?.stage || ''}
+          disabled={uploadMode && !cioFile}
+          progress={chainJob?.progress || 0}
+          stage={chainJob?.stage || ''}
         />
 
         <div className="sidebar-footer">
@@ -211,86 +241,73 @@ export default function App() {
             <button onClick={() => setError(null)} className="error-close">✕</button>
           </div>
         )}
-        {!results && !predictionJob && !running && (
-          <div className="empty-state">
-            <h2>选择参数后点击"运行"</h2>
-            <p>左侧面板设置参数 → 点击运行按钮 → 结果将展示在这里</p>
+
+        {/* 顶部阶段条：只读 stageIndex，与三段产物区同一判据 */}
+        {uploadMode && chainJob && (
+          <div className="chain-stage-bar" aria-label="链路阶段进度">
+            <div className="chain-stage-track">
+              {STAGE_STEPS.map((step, index) => {
+                const state = stageState(step.n);
+                return (
+                  <Fragment key={step.n}>
+                    {index > 0 && (
+                      <span
+                        className={`chain-stage-link ${stageIndex >= step.n ? 'done' : ''}`}
+                        aria-hidden="true"
+                      />
+                    )}
+                    <span className={`chain-stage is-${state}`}>
+                      <i className="chain-stage-dot">
+                        {state === 'done' ? '✓' : state === 'skipped' ? '–' : step.n}
+                      </i>
+                      <span className="chain-stage-label">{stageLabel(step.n)}</span>
+                    </span>
+                  </Fragment>
+                );
+              })}
+            </div>
+            <div className="chain-stage-meta">
+              <span className="chain-stage-text">{chainJob.stage || '等待链路执行'}</span>
+              <span className="chain-stage-percent">{Math.round(Number(chainJob.progress) || 0)}%</span>
+            </div>
+            {stageFailed && chainJob.error && <p className="chain-stage-error">⚠️ {chainJob.error}</p>}
           </div>
         )}
 
-        {running && dataSource === 'upload' && (
+        {uploadMode && !chainJob && !running && (
           <div className="empty-state">
-            <h2>{predictionJob?.stage || '正在创建模型任务'}</h2>
+            <h2>上传一次即可跑完整条链</h2>
             <p>
-              真实进度：{Math.round(predictionJob?.progress || 0)}% ·
-              {uploadKind === 'zip'
-                ? ' 前 30% 为原始场投影，其后为逐格点加载并运行模型'
-                : ' 后端正在逐格点加载并运行模型'}
+              选择 .zip（原始 U850 气象场）或 .npy（已投影 CIO 序列）→ 点击“运行” →
+              投影 CIO → 归一化窗口 → LSTM 降水推理 由上到下依次解锁，中途不需要重新选文件。
             </p>
           </div>
         )}
 
-        {predictionJob?.status === 'completed' && dataSource === 'upload' && activeModule === 'lstm' && (
-          <LivePredictionResult job={predictionJob} confidence={params.cioSignificance} />
+        {/* 三段竖排：每段按 stageIndex 单独解锁，不必等整条链跑完 */}
+        {uploadMode && stageIndex >= STAGE_PROJECTION && (
+          <section className="chain-stage-group">
+            <h2 className="chain-stage-heading">阶段① 投影 CIO</h2>
+            <CioProjectionResult job={chainJob} confidence={params.cioSignificance} />
+          </section>
         )}
 
-        {predictionJob?.status === 'completed' && dataSource === 'upload' && activeModule === 'cio' && (
-          <CioProjectionResult
-            job={predictionJob}
-            onShowPrediction={() => setActiveModule('lstm')}
-          />
+        {uploadMode && stageIndex >= STAGE_NORMALIZATION && (
+          <section className="chain-stage-group">
+            <h2 className="chain-stage-heading">阶段② 归一化窗口</h2>
+            <NormalizationPanel job={chainJob} />
+          </section>
         )}
 
-        {results && activeModule === 'cio' && dataSource === 'upload' && !results.cioTS && (
-          <div className="empty-state">
-            <h2>暂无 CIO 数据</h2>
-            <p>CIO 指数与相关分布需要 SST+Uwind 输入计算，后端暂未接入真实计算（mock 模拟已关停）。</p>
-          </div>
+        {/* 只跑投影的任务 stageIndex 停在 2，这里天然不会渲染（验收 5） */}
+        {uploadMode && runScope === 'full' && stageIndex >= STAGE_PREDICTION && (
+          <section className="chain-stage-group">
+            <h2 className="chain-stage-heading">阶段③ LSTM 降水预测</h2>
+            <LivePredictionResult job={chainJob} confidence={params.cioSignificance} />
+          </section>
         )}
 
-        {results && activeModule === 'cio' && dataSource === 'upload' && results.cioTS && (
-          <div className="result-row">
-            <div className="result-card" style={{ flex: 1 }}>
-              <h3 className="result-title">CIO指数时序曲线</h3>
-              <ResponsiveContainer width="100%" height={250}>
-                <LineChart data={results.cioTS.filter((_, i) => i % 20 === 0).map((v, i) => ({ t: i * 20, v }))} margin={{ bottom: 30 }}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="t" label={{ value: '时间 (天)', position: 'insideBottom', offset: -5 }} />
-                  <YAxis />
-                  <Tooltip />
-                  <Line type="monotone" dataKey="v" stroke="#1a478a" dot={false} name="CIO指数" />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-            <div className="result-card" style={{ flex: 1 }}>
-              <h3 className="result-title">CIO-降水相关空间分布 (显著性: {params.cioSignificance})</h3>
-              <div className="heatmap-container">
-                <div className="heatmap-scroll" style={{ maxHeight: 260 }}>
-                  {results.cioCorr.data.slice(0, 30).map((row, i) => (
-                    <div key={i} className="mini-row">
-                      {row.slice(0, 60).map((v, j) => (
-                        <div key={j} className="mini-cell" style={{
-                          backgroundColor: corrColor(v),
-                          width: `${100 / 60}%`,
-                        }} title={`r = ${v.toFixed(3)}`} />
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              </div>
-              <ColorBar />
-            </div>
-          </div>
-        )}
-
-        {results && activeModule === 'cio' && dataSource === 'default' && (
-          <div className="empty-state">
-            <h2>CIO计算与验证不可用</h2>
-            <p>CIO 计算需要原始 SST+Uwind 数据输入，后端暂未接入真实计算，本模块暂时无数据可显示。</p>
-          </div>
-        )}
-
-        {results && dataSource === 'default' && activeModule === 'lstm' && (
+        {results && !uploadMode && (
           <>
             <div className="result-row">
               <div className="result-col">
@@ -311,35 +328,14 @@ export default function App() {
             <ResultsTable data={results.table} />
           </>
         )}
+
+        {!results && !chainJob && !running && !uploadMode && (
+          <div className="empty-state">
+            <h2>选择参数后点击"运行"</h2>
+            <p>左侧面板设置参数 → 点击运行按钮 → 结果将展示在这里</p>
+          </div>
+        )}
       </main>
-    </div>
-  );
-}
-
-function corrColor(v) {
-  const t = (v + 1) / 2;
-  const r = Math.round(30 + t * 200);
-  const b = Math.round(200 - t * 170);
-  return `rgb(${r}, 80, ${b})`;
-}
-
-function ColorBar() {
-  const stops = [-1, -0.5, 0, 0.5, 1];
-  return (
-    <div className="colorbar" title="Pearson 相关系数 r">
-      <div
-        className="colorbar-gradient"
-        style={{
-          background: `linear-gradient(to right, ${corrColor(-1)}, ${corrColor(0)}, ${corrColor(1)})`,
-        }}
-      />
-      <div className="colorbar-ticks">
-        {stops.map(v => <span key={v}>{v}</span>)}
-      </div>
-      <div className="colorbar-labels">
-        <span>低 (r=-1)</span>
-        <span>高 (r=1)</span>
-      </div>
     </div>
   );
 }

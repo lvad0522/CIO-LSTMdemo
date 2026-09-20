@@ -54,7 +54,10 @@ DEFAULT_MODEL_ARCHIVE = (
     PROJECT_ROOT / "新端口-模型训练" / "pre1_2000.tar.gz"
 )
 MODEL_ARCHIVE = Path(os.environ.get("MODEL_ARCHIVE", DEFAULT_MODEL_ARCHIVE))
-JOB_ROOT = BACKEND_DIR / "uploads" / "prediction_jobs"
+JOB_ROOT = Path(os.environ.get(
+    "PREDICTION_JOB_ROOT",
+    BACKEND_DIR / "uploads" / "prediction_jobs",
+))
 
 # CIO 模态固定资产：投影 ∝ e 的后 3321 列。真件在服务器
 # /mnt/mydisk2/zxy/data/rain/CIOmode_1982_2017.mat，需手工放入 assets/。

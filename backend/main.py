@@ -30,9 +30,16 @@ from real_data import (
     gen_results_table,
 )
 from live_prediction import router as live_prediction_router
+from cio_diagnostics import router as cio_diagnostics_router
+from chain import router as chain_router
 
 app = FastAPI(title="CIO+LSTM 降水预测 API")
+# 三个 router 前缀互不重叠：/api/predict（在线推理）、/api/cio（投影诊断）、
+# /api/chain（一条链）。`/api/chain` 是独立前缀，与另两个无路由冲突，
+# 也不吞掉它们任何端点（旧路由一行不改）。
 app.include_router(live_prediction_router)
+app.include_router(cio_diagnostics_router)
+app.include_router(chain_router)
 
 app.add_middleware(
     CORSMiddleware,

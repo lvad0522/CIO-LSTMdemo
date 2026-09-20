@@ -1,8 +1,4 @@
-import { useRef } from 'react';
-
 export default function ResultsTable({ data }) {
-  const tableRef = useRef(null);
-
   const handleExportCSV = () => {
     if (!data || data.length === 0) return;
     const headers = ['实验次数', 'Pearson r', 'RMSE (mm/day)', 'MAE (mm/day)'];

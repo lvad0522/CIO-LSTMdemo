@@ -179,14 +179,6 @@
   gap: 2px;
 }
 .upload-error { margin-top: 8px; font-size: 12px; color: #ff8a8a; }
-.badge-disabled {
-  margin-left: auto;
-  font-size: 10px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: rgba(209, 162, 76, .13);
-  color: #dfbd7c;
-}
 
 /* ─── 参数组 ─── */
 .param-group { margin-bottom: 10px; }
@@ -479,6 +471,15 @@
   background: linear-gradient(90deg, rgb(0,0,220), #fff, rgb(220,0,0));
   border: 1px solid #ddd;
 }
+.correlation-gradient {
+  flex: 1;
+  height: 10px;
+  border-radius: 3px;
+  border: 1px solid #ddd;
+  background: linear-gradient(90deg,
+    #3A5FCD 0%, #8AA9DE 25%, #D8E2F0 45%, #F7F7F7 50%,
+    #FDDBC7 60%, #F4A582 70%, #D6604D 80%, #B2182B 90%, #67001F 100%);
+}
 .prediction-slider-label {
   display: flex;
   align-items: center;
@@ -599,6 +600,124 @@
 .result-col {
   flex: 1;
   min-width: 0;
+}
+
+/* --- CIO 链路诊断 --- */
+.cio-figure-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+.cio-panel {
+  position: relative;
+  min-width: 0;
+  padding-top: 12px;
+  border-top: 1px solid #dce6e9;
+}
+.cio-panel-wide { grid-column: 1 / -1; }
+.cio-panel h4 {
+  margin: 0 0 8px;
+  padding-left: 28px;
+  color: #315b68;
+  font-size: 13px;
+  font-weight: 600;
+}
+.cio-panel-tag {
+  position: absolute;
+  top: 12px;
+  left: 0;
+  color: #397889;
+  font-size: 12px;
+  font-weight: 700;
+}
+.cio-unavailable {
+  min-height: 170px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 18px;
+  border: 1px dashed #c7d7dc;
+  border-radius: 6px;
+  background: #f8fbfc;
+  color: #70858d;
+  text-align: center;
+}
+.cio-unavailable strong { color: #3c6471; font-size: 13px; }
+.cio-unavailable span { max-width: 520px; font-size: 12px; line-height: 1.6; }
+.cio-line-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin-top: 14px;
+  color: #5d7077;
+  font-size: 12px;
+}
+.cio-line-key span { display: inline-flex; align-items: center; gap: 7px; }
+.cio-line-key i {
+  display: inline-block;
+  width: 22px;
+  height: 0;
+  border-top: 2px solid #aeb9bd;
+}
+.cio-line-key i.is-actual { border-color: #3156a3; }
+.cio-line-key i.is-projected { border-color: #3b8734; }
+.cio-line-key .is-pending { color: #8c989d; }
+.cio-line-key .is-pending i { border-top-style: dashed; }
+.cio-mode-map-wrap { min-width: 0; }
+.cio-mode-map {
+  width: 100%;
+  aspect-ratio: 81 / 41;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #dbe4e7;
+  background: #eef2f3;
+}
+.cio-mode-row { display: flex; flex: 1 1 0; min-height: 0; }
+.cio-mode-cell { flex: 1 1 0; min-width: 0; }
+.cio-axis-row {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 5px;
+  color: #74878e;
+  font-size: 11px;
+}
+.cio-mode-legend {
+  display: grid;
+  grid-template-columns: auto minmax(90px, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+  color: #697c83;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 900px) {
+  .cio-figure-grid { grid-template-columns: 1fr; }
+  .cio-panel-wide { grid-column: auto; }
+  .result-row { flex-direction: column; }
+}
+
+@media (max-width: 680px) {
+  .app {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+    flex-direction: column;
+  }
+  .sidebar {
+    width: 100%;
+    min-width: 0;
+    max-height: none;
+    overflow-y: visible;
+  }
+  .main-content { padding: 18px 14px; overflow-y: visible; }
+  .result-card { padding: 15px; }
+  .result-header { align-items: flex-start; gap: 10px; }
+  .cio-mode-legend { grid-template-columns: auto minmax(60px, 1fr) auto auto; }
 }
 
 /* ─── 热力图 ─── */
@@ -750,36 +869,6 @@
   stroke: none !important;
 }
 
-/* ─── CIO 相关系数色标 ─── */
-.colorbar {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: 10px;
-  font-size: 11px;
-  color: #666;
-}
-.colorbar-gradient {
-  width: 100%;
-  height: 10px;
-  border-radius: 3px;
-}
-.colorbar-ticks {
-  display: flex;
-  justify-content: space-between;
-  width: 100%;
-  padding: 0 2px;
-  font-size: 10px;
-  color: #888;
-}
-.colorbar-labels {
-  display: flex;
-  justify-content: space-between;
-  width: 100%;
-  font-size: 10px;
-  color: #888;
-}
-
 /* --- 预测/实况切换 与 逐格点相关系数图（2026-09-16） --- */
 .view-toggle {
   display: flex;
@@ -807,7 +896,8 @@
   color: #b3bcc5;
   cursor: not-allowed;
 }
-/* r 图的色标复用 .prediction-gradient（同为中心对称发散色标） */
+/* 旧版 Pearson 蓝-白-红色标由 .prediction-gradient 提供，保留给降水图；
+   当前 Pearson 使用 .correlation-gradient 九节点色标。 */
 .legend-swatch {
   display: inline-block;
   width: 12px;
@@ -832,4 +922,132 @@
 }
 .param-locked .param-hint {
   color: #8a7a4a;
+}
+
+/* ─── 一条链：顶部阶段条 + 三段竖排 ─── */
+/* 阶段条只读任务的 stageIndex，与产物区用同一判据（design D11） */
+.chain-stage-bar {
+  background: #fff;
+  border: 1px solid #e5edf1;
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(29, 59, 72, .055);
+  padding: 14px 18px;
+  margin-bottom: 18px;
+}
+.chain-stage-track {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.chain-stage {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #9aa9b0;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.chain-stage-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1px solid #cfdde3;
+  background: #f4f7fa;
+  color: #9aa9b0;
+  font-size: 12px;
+  font-style: normal;
+  line-height: 1;
+}
+.chain-stage.is-done { color: #2d6a76; }
+.chain-stage.is-done .chain-stage-dot {
+  background: #3b8734;
+  border-color: #3b8734;
+  color: #fff;
+}
+.chain-stage.is-active { color: #24566a; font-weight: 600; }
+.chain-stage.is-active .chain-stage-dot {
+  background: #e8f3f4;
+  border-color: #2d6a76;
+  color: #2d6a76;
+  animation: chain-stage-pulse 1.4s ease-in-out infinite;
+}
+.chain-stage.is-skipped { color: #b3a274; }
+.chain-stage.is-skipped .chain-stage-dot { border-style: dashed; }
+.chain-stage.is-failed { color: #c0392b; }
+.chain-stage.is-failed .chain-stage-dot {
+  background: #fdecec;
+  border-color: #d05b5b;
+  color: #c0392b;
+}
+.chain-stage-link {
+  flex: 1;
+  min-width: 18px;
+  height: 1px;
+  background: #dce6e9;
+}
+.chain-stage-link.done { background: #3b8734; }
+.chain-stage-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #667980;
+}
+.chain-stage-percent {
+  font-weight: 600;
+  color: #2d6a76;
+  font-variant-numeric: tabular-nums;
+}
+.chain-stage-error {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #c0392b;
+}
+.chain-stage-skip {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: #fff8e6;
+  border: 1px solid #f0e0b0;
+  color: #8a6d1f;
+  font-size: 12px;
+  line-height: 1.6;
+}
+@keyframes chain-stage-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(45, 106, 118, .28); }
+  50% { box-shadow: 0 0 0 5px rgba(45, 106, 118, 0); }
+}
+.chain-stage-group { margin-bottom: 26px; }
+.chain-stage-heading {
+  font-size: 16px;
+  font-weight: 700;
+  color: #24566a;
+  margin: 0 0 12px;
+  padding-left: 10px;
+  border-left: 4px solid #2d6a76;
+  line-height: 1.3;
+}
+
+/* ─── 阶段② 归一化窗口 ─── */
+.normalization-summary {
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border-radius: 6px;
+  background: #f2f8f9;
+  border: 1px solid #dce6e9;
+  color: #24566a;
+  font-size: 13px;
+  font-family: ui-monospace, Consolas, monospace;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+@media (max-width: 680px) {
+  .chain-stage-track { flex-wrap: wrap; }
+  .chain-stage-link { min-width: 10px; }
 }

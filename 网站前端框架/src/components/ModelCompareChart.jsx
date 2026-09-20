@@ -1,6 +1,6 @@
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid,
-  Legend, ReferenceLine, ResponsiveContainer,
+  ReferenceLine, ResponsiveContainer,
   BarChart, Bar, Cell,
 } from 'recharts';
 

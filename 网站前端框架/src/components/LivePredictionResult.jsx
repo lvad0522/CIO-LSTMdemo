@@ -2,8 +2,9 @@ import { Fragment, useEffect, useRef, useState } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
+import { getHeatColor } from '../utils/heatColor';
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
+const API_BASE = import.meta.env.VITE_API_BASE || '';
 const CELL_SCALE = 6;
 const GEO_URL = '/geo/east_asia_coastline.json?v=1';
 const MAP_ROWS = 81;
@@ -27,12 +28,12 @@ function precipColor(value, maxAbs) {
   return `rgb(${fade}, ${fade}, 220)`;
 }
 
-// r 图：以 0 为中心的蓝-白-红发散色标（与 /api/run 的 corrColor 同一观感）
-function rColor(value) {
-  const t = Math.max(-1, Math.min(1, value));
-  const fade = Math.round(255 * (1 - Math.abs(t)));
-  return t >= 0 ? `rgb(255, ${fade}, ${fade})` : `rgb(${fade}, ${fade}, 255)`;
-}
+// 旧版 Pearson 蓝-白-红色标保留作对照，当前不启用：
+// function rColor(value) {
+//   const t = Math.max(-1, Math.min(1, value));
+//   const fade = Math.round(255 * (1 - Math.abs(t)));
+//   return t >= 0 ? `rgb(255, ${fade}, ${fade})` : `rgb(${fade}, ${fade}, 255)`;
+// }
 
 const VIEW_LABELS = {
   prediction: '预测场',
@@ -231,8 +232,8 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
   useEffect(() => {
     const controller = new AbortController();
     const path = view === 'truth'
-      ? `${API_BASE}/api/predict/jobs/${job.jobId}/truth/preview`
-      : `${API_BASE}/api/predict/jobs/${job.jobId}/preview`;
+      ? `${API_BASE}/api/chain/jobs/${job.jobId}/truth/preview`
+      : `${API_BASE}/api/chain/jobs/${job.jobId}/preview`;
     fetch(`${path}?time_index=${timeIndex}`, { signal: controller.signal })
       .then(async (res) => {
         const data = await res.json();
@@ -250,7 +251,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
   useEffect(() => {
     if (!pearsonAvailable) return undefined;
     const controller = new AbortController();
-    fetch(`${API_BASE}/api/predict/jobs/${job.jobId}/pearson?confidence=${confidence}`, {
+    fetch(`${API_BASE}/api/chain/jobs/${job.jobId}/pearson?confidence=${confidence}`, {
       signal: controller.signal,
     })
       .then(async (res) => {
@@ -267,7 +268,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
 
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`${API_BASE}/api/predict/jobs/${job.jobId}/grid?i=${selectedGrid.i}&j=${selectedGrid.j}`, {
+    fetch(`${API_BASE}/api/chain/jobs/${job.jobId}/grid?i=${selectedGrid.i}&j=${selectedGrid.j}`, {
       signal: controller.signal,
     })
       .then(async (res) => {
@@ -326,7 +327,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
         if (value === null || !Number.isFinite(value)) {
           ctx.fillStyle = '#2b2b2b';            // 无定义（时间维恒定）
         } else {
-          ctx.fillStyle = rColor(value);
+          ctx.fillStyle = getHeatColor(value);
           ctx.fillRect(x, y, CELL_SCALE, CELL_SCALE);
           if (Math.abs(value) < threshold) {
             ctx.fillStyle = 'rgba(240, 240, 240, 0.82)';   // 未过显著性的淡化
@@ -586,7 +587,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
               })()}
               <div className="prediction-legend">
                 <span>r = -1</span>
-                <div className="prediction-gradient" />
+                <div className="correlation-gradient" />
                 <span>r = +1</span>
                 <span className="legend-swatch legend-swatch-muted" />未过显著性
                 <span className="legend-swatch legend-swatch-void" />无定义

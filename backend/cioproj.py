@@ -256,9 +256,10 @@ def compute_cioproj(which: str = "u850", nc_dir: str = None, years=(),
     per_year = {}
     for (y, _mo, _d) in rows:
         per_year[y] = per_year.get(y, 0) + 1
+    dates = ["%04d-%02d-%02d" % row for row in rows]
     meta = {"which": "u850", "lead": lead, "years": years,
             "length": int(series.size), "days_per_year": per_year,
-            "missing_months": missing, "window": window(lead)}
+            "missing_months": missing, "window": window(lead), "dates": dates}
     if missing:
         meta["warning"] = ("缺这些月份的源文件 %s —— 窗口天数不足 112/年，"
                            "与官方序列会有偏差" % missing)

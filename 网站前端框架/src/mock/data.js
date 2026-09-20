@@ -28,24 +28,6 @@ export function genCIOTimeSeries(length = 2240) {
   return data;
 }
 
-// 生成CIO-降水相关空间分布
-export function genCIOCorrelationMap() {
-  const rows = 40, cols = 80;
-  const rng = seededRandom(123);
-  const data = [];
-  for (let i = 0; i < rows; i++) {
-    const row = [];
-    for (let j = 0; j < cols; j++) {
-      const latFactor = Math.sin((i / rows) * Math.PI);
-      const lonFactor = Math.sin((j / cols) * Math.PI * 0.8 + 0.5);
-      let v = latFactor * lonFactor * 0.7 + (rng() - 0.5) * 0.2;
-      row.push(Math.max(-1, Math.min(1, v)));
-    }
-    data.push(row);
-  }
-  return { data, rows, cols };
-}
-
 // 生成预测技能空间分布
 export function genSkillMap(region = "india") {
   const rows = region === "india" ? 50 : 25;
@@ -67,6 +49,7 @@ export function genSkillMap(region = "india") {
 
 // 生成某格点的预测vs真实时序
 export function genTimeSeries(region = "india", gridI = 25, gridJ = 40) {
+  void region; // 保留旧调用签名；当前模拟时序不按区域区分。
   const rng = seededRandom(gridI * 1000 + gridJ);
   const length = 112;
   const real = [];
@@ -85,7 +68,7 @@ export function genTimeSeries(region = "india", gridI = 25, gridJ = 40) {
 export function genS2SComparison() {
   const rng = seededRandom(789);
   const lstmR = 0.62;
-  return S2S_MODELS.map((name, i) => ({
+  return S2S_MODELS.map((name) => ({
     name,
     r: 0.12 + rng() * 0.24,
   })).concat([{ name: "LSTM+CIO", r: lstmR }]);

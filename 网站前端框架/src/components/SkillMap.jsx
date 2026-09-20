@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { getHeatColor } from '../utils/heatColor';
 
 // 剖面图已注释停用（2026-08-25：热力图已完整展示 r 分布，单行剖面价值有限）；
 // 如需恢复，取消本行注释并还原下方 barData / selectedI / cross-section 区块
@@ -61,59 +62,30 @@ function gaussianSmooth(grid) {
 // URL 带版本号防生产构建缓存失效（重跑导出脚本后递增）。
 const GEO_URL = '/geo/east_asia_coastline.json?v=1';
 
-// ── 色标约定（2026-08-29：与 skill_map_nature.py 顶刊模板同源的自定义发散色板）──
-// 范围 [-0.3, 1.0]，TwoSlopeNorm(vmin=-0.3, vcenter=0, vmax=1.0)；
+// ── 色标约定（与 CIO/Pearson 空间图共享）──
+// 范围 [-1, 1]，零点位于色标中心；
 // 中心 0 = 中性浅灰白 #F7F7F7（弱化无技能区）；
 // 正值多层暖色：浅杏 #FDDBC7 → 珊瑚橙 #F4A582 → 暖红 #D6604D → 红 #B2182B → 深酒红 #67001F；
 // 负值柔和雾霾蓝：#3A5FCD → #D8E2F0（不抢眼）。
-const COLOR_MIN = -0.3;
-const COLOR_MAX = 1.0;
 
-// [TwoSlopeNorm 输出位置, 颜色] 节点，与 Python 模板 COLOR_NODES 完全一致
-const COLOR_NODES = [
-  [0.00, '#3A5FCD'],   // r=-0.30 雾霾蓝
-  [0.25, '#8AA9DE'],   // r=-0.15
-  [0.45, '#D8E2F0'],   // r=-0.03 浅雾霾蓝
-  [0.50, '#F7F7F7'],   // r= 0.00 中性浅灰白
-  [0.60, '#FDDBC7'],   // r= 0.20 浅杏
-  [0.70, '#F4A582'],   // r= 0.40 珊瑚橙
-  [0.80, '#D6604D'],   // r= 0.60 暖红
-  [0.90, '#B2182B'],   // r= 0.80 红
-  [1.00, '#67001F'],   // r= 1.00 深酒红
-];
-
-function hexToRgb(h) {
-  const n = parseInt(h.slice(1), 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-}
-
-function lerpColor(t, cFrom, cTo) {
-  const a = hexToRgb(cFrom);
-  const b = hexToRgb(cTo);
-  const c = a.map((v, k) => Math.round(v + (b[k] - v) * t));
-  return `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
-}
-
-// TwoSlopeNorm 归一化：v<=0 → 0.5*(v-vmin)/(0-vmin)；v>0 → 0.5 + 0.5*v/vmax
-function normPos(v) {
-  if (v <= 0) return 0.5 * (v - COLOR_MIN) / (0 - COLOR_MIN);
-  return 0.5 + 0.5 * v / COLOR_MAX;
-}
-
-function getHeatColor(v) {
-  if (Number.isNaN(v)) return '#f0f0f0';
-  const pos = Math.max(0, Math.min(1, normPos(v)));
-  const nodes = COLOR_NODES;
-  // 在相邻节点区间内线性插值（与 matplotlib LinearSegmentedColormap 一致）
-  for (let k = 0; k < nodes.length - 1; k++) {
-    if (pos <= nodes[k + 1][0]) {
-      const [p0, c0] = nodes[k];
-      const [p1, c1] = nodes[k + 1];
-      return lerpColor((pos - p0) / (p1 - p0), c0, c1);
-    }
-  }
-  return nodes[nodes.length - 1][1];
-}
+// 旧版 [-0.3, 1] 色标保留作对照，当前不启用：
+// const COLOR_MIN = -0.3;
+// const COLOR_MAX = 1.0;
+// const COLOR_NODES = [
+//   [0.00, '#3A5FCD'],   // r=-0.30 雾霾蓝
+//   [0.25, '#8AA9DE'],   // r=-0.15
+//   [0.45, '#D8E2F0'],   // r=-0.03 浅雾霾蓝
+//   [0.50, '#F7F7F7'],   // r= 0.00 中性浅灰白
+//   [0.60, '#FDDBC7'],   // r= 0.20 浅杏
+//   [0.70, '#F4A582'],   // r= 0.40 珊瑚橙
+//   [0.80, '#D6604D'],   // r= 0.60 暖红
+//   [0.90, '#B2182B'],   // r= 0.80 红
+//   [1.00, '#67001F'],   // r= 1.00 深酒红
+// ];
+// function oldNormPos(v) {
+//   if (v <= 0) return 0.5 * (v - COLOR_MIN) / (0 - COLOR_MIN);
+//   return 0.5 + 0.5 * v / COLOR_MAX;
+// }
 
 // ── 0.5 等值线（Marching Squares 简化版）──
 // 数据格点 (i, j)（i=0 为 20°N 南端）→ 显示坐标 x=j, y=rows-i（北在上），
@@ -331,9 +303,9 @@ export default function SkillMap({ data, region, onGridClick }) {
           ))}
           <span className="lon-title">经度 (°E)</span>
         </div>
-        {/* 自定义发散色板图例（TwoSlopeNorm 刻度：0 在 50%、0.5 在 75%） */}
+        {/* 共享九节点色板图例：相关系数固定覆盖 [-1, 1]。 */}
         <div className="heatmap-legend">
-          <span>-0.3</span>
+          <span>-1</span>
           <div className="legend-gradient">
             <div className="legend-ticks">
               <span style={{ left: '50%' }}>0</span>

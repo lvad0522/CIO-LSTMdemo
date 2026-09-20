@@ -52,26 +52,6 @@ def gen_cio_time_series(filter_low=0.02, filter_high=0.1, cio_region='tropical',
     return data
 
 
-def gen_cio_correlation_map(significance=0.95, cio_region='tropical'):
-    """生成 CIO-降水相关空间分布，参数改变时空间格局变化。"""
-    rows, cols = 40, 80
-    seed = hash((round(significance, 3), cio_region)) % 1000000
-    rng = SeededRandom(seed)
-    # 显著性越高，信号越强、噪声越小
-    signal_strength = 0.5 + significance * 0.2
-    noise_amp = 0.25 - significance * 0.1
-    data = []
-    for i in range(rows):
-        row = []
-        for j in range(cols):
-            lat_factor = math.sin((i / rows) * math.pi)
-            lon_factor = math.sin((j / cols) * math.pi * 0.8 + 0.5)
-            v = lat_factor * lon_factor * signal_strength + (rng.random() - 0.5) * noise_amp
-            row.append(max(-1, min(1, v)))
-        data.append(row)
-    return {"data": data, "rows": rows, "cols": cols}
-
-
 def gen_skill_map(region="india"):
     _check_region(region)
     rows = 50 if region == "india" else 25
