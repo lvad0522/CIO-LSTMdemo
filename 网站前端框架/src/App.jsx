@@ -11,6 +11,7 @@ import TimeSeriesChart from './components/TimeSeriesChart';
 import ModelCompareChart from './components/ModelCompareChart';
 import ResultsTable from './components/ResultsTable';
 import LivePredictionResult from './components/LivePredictionResult';
+import CioProjectionResult from './components/CioProjectionResult';
 import './App.css';
 
 // 后端地址：默认 8000，可用 VITE_API_BASE 覆盖（如换端口起第二套后端时不改代码）
@@ -78,9 +79,6 @@ export default function App() {
     setError(null);
     try {
       if (dataSource === 'upload') {
-        if (activeModule !== 'lstm') {
-          throw new Error('当前临时验证只接入 LSTM 降雨预测模块');
-        }
         if (!cioFile) {
           throw new Error(uploadKind === 'zip'
             ? '请先选择原始气象场 .zip 文件'
@@ -140,7 +138,7 @@ export default function App() {
     } finally {
       setRunning(false);
     }
-  }, [params, dataSource, activeModule, cioFile, uploadKind]);
+  }, [params, dataSource, cioFile, uploadKind]);
 
   const handleGridClick = useCallback(async (i, j, region) => {
     setSelectedGrid({ i, j });
@@ -195,7 +193,7 @@ export default function App() {
         <RunButton
           onRun={handleRun}
           running={running}
-          disabled={dataSource === 'upload' && (!cioFile || activeModule !== 'lstm')}
+          disabled={dataSource === 'upload' && !cioFile}
           progress={predictionJob?.progress || 0}
           stage={predictionJob?.stage || ''}
         />
@@ -234,6 +232,13 @@ export default function App() {
 
         {predictionJob?.status === 'completed' && dataSource === 'upload' && activeModule === 'lstm' && (
           <LivePredictionResult job={predictionJob} confidence={params.cioSignificance} />
+        )}
+
+        {predictionJob?.status === 'completed' && dataSource === 'upload' && activeModule === 'cio' && (
+          <CioProjectionResult
+            job={predictionJob}
+            onShowPrediction={() => setActiveModule('lstm')}
+          />
         )}
 
         {results && activeModule === 'cio' && dataSource === 'upload' && !results.cioTS && (
