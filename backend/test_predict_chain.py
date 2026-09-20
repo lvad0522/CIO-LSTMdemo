@@ -130,6 +130,60 @@ else:
     except Exception as exc:                       # noqa: BLE001
         print("  跳过：import prediction 失败 %r" % (exc,))
 
+# ============================================================ C0. 格点时序接口契约（不依赖夹具）
+
+print("C0. 格点时序接口契约（prediction + real2）")
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+grid_app = FastAPI()
+grid_app.include_router(lp.router)
+grid_client = TestClient(grid_app)
+grid_job_id = "grid-series-contract"
+grid_dir = HERE / "_tmp_grid_series"
+shutil.rmtree(grid_dir, ignore_errors=True)
+grid_dir.mkdir(parents=True)
+try:
+    rng = np.random.default_rng(20260920)
+    pred = rng.standard_normal((lp.GRID_ROWS, lp.GRID_COLS, lp.N_STEPS)).astype(np.float32)
+    truth = (pred * 0.8 + rng.standard_normal(pred.shape) * 0.2).astype(np.float32)
+    pred_path = grid_dir / "prediction.npy"
+    truth_path = grid_dir / "pre_1_2000(1)_real2.npy"
+    np.save(pred_path, pred, allow_pickle=False)
+    np.save(truth_path, truth, allow_pickle=False)
+    r_map = lp.verification.pearson_map(pred, truth).astype(np.float32)
+    np.save(lp._pearson_path(grid_dir), r_map, allow_pickle=False)
+    lp._jobs[grid_job_id] = {
+        "jobId": grid_job_id,
+        "status": "completed",
+        "resultPath": str(pred_path),
+        "result": {
+            "verification": {
+                "available": True,
+                "truthPath": str(truth_path),
+                "truthName": truth_path.name,
+            },
+        },
+    }
+
+    response = grid_client.get(
+        "/api/predict/jobs/%s/grid?i=40&j=50" % grid_job_id
+    )
+    payload = response.json()
+    check(response.status_code == 200 and len(payload["pred"]) == lp.N_STEPS
+          and len(payload["truth"]) == lp.N_STEPS,
+          "格点端点返回 112 步预测与 real2 实况", response.status_code)
+    check(np.allclose(payload["pred"], pred[40, 50])
+          and np.allclose(payload["truth"], truth[40, 50]),
+          "格点端点切片与源数组逐项一致")
+    check(payload["truthName"] == truth_path.name,
+          "格点端点留痕 real2 文件名", payload["truthName"])
+    check(abs(payload["r"] - float(r_map[40, 50])) < 1e-7,
+          "格点端点返回同口径 Pearson r", payload["r"])
+finally:
+    lp._jobs.pop(grid_job_id, None)
+    shutil.rmtree(grid_dir, ignore_errors=True)
+
 # ============================================================ C. API 契约
 
 print("C. API 契约（POST /api/predict/jobs）")
@@ -137,9 +191,6 @@ FIX = find_fixture()
 if FIX is None:
     print("  跳过：没找到夹具（设 CIOPROJ_FIXTURE 指定）")
 else:
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
     MAT = FIX / "rain" / "CIOmode_1982_2017.mat"
     NC = FIX / "U850"
     os.environ["CIOPROJ_MAT"] = str(MAT)
@@ -375,6 +426,16 @@ else:
         check(r.status_code == 200 and r.json()["rows"] == 81
               and len(r.json()["data"]) == 81,
               "实况场预览端点可用", r.status_code)
+
+        r = client.get("/api/predict/jobs/%s/grid?i=40&j=50" % jid)
+        grid = r.json()
+        check(r.status_code == 200 and len(grid["pred"]) == 112
+              and len(grid["truth"]) == 112,
+              "格点端点同时返回 112 步预测与 real2 实况", r.status_code)
+        check(grid["pred"] == grid["truth"] and grid["truthName"] == truth_file,
+              "格点实况来自本任务已校验的 real2 文件", grid.get("truthName"))
+        check(grid["r"] is not None and abs(grid["r"] - 1.0) < 1e-6,
+              "格点端点返回同口径 Pearson r", grid["r"])
 
         # --- C9: 实况有歧义（两份内容不同）必须拒绝，不能挑一份
         np.save(day / "pre_1_2000(2)_20_40_100_125_0.25_real2.npy", truth + 1.0)

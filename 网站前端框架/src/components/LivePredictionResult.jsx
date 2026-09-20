@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from 'react';
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from 'recharts';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
@@ -310,14 +310,13 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
     );
   }, [frame, selectedGrid]);
 
-  // r 图：通过显著性的格点上色，没通过的盖一层灰 —— 显著性直接画在图上
+  // r 图直接按相关系数上色；显著性阈值只保留在摘要统计中，不改变热力图颜色。
   useEffect(() => {
     if (!pearson || !rCanvasRef.current) return;
     const canvas = rCanvasRef.current;
     canvas.width = pearson.cols * CELL_SCALE;
     canvas.height = pearson.rows * CELL_SCALE;
     const ctx = canvas.getContext('2d');
-    const threshold = pearson.criticalR;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     pearson.data.forEach((row, i) => {
       row.forEach((value, j) => {
@@ -327,12 +326,6 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
           ctx.fillStyle = '#2b2b2b';            // 无定义（时间维恒定）
         } else {
           ctx.fillStyle = rColor(value);
-          ctx.fillRect(x, y, CELL_SCALE, CELL_SCALE);
-          if (Math.abs(value) < threshold) {
-            ctx.fillStyle = 'rgba(240, 240, 240, 0.82)';   // 未过显著性的淡化
-          } else {
-            return;
-          }
         }
         ctx.fillRect(x, y, CELL_SCALE, CELL_SCALE);
       });
@@ -370,7 +363,9 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
   const chartData = (gridSeries?.pred || []).map((value, index) => ({
     day: index + 1,
     prediction: value,
+    truth: gridSeries?.truth?.[index] ?? null,
   }));
+  const hasTruthSeries = Array.isArray(gridSeries?.truth);
   const result = job.result || {};
 
   const projection = job.projection || {};
@@ -472,16 +467,34 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
         <div className="result-col">
           <div className="result-card">
             <h3 className="result-title">
-              格点预测时序
+              {hasTruthSeries ? '格点预测与实况时序' : '格点预测时序'}
               <span className="region-badge">({selectedGrid.j}, {selectedGrid.i})</span>
             </h3>
+            {hasTruthSeries && (
+              <p className="metric-note">
+                Pearson r = {gridSeries.r == null ? '无定义' : Number(gridSeries.r).toFixed(4)}
+                {' · '}实况：{gridSeries.truthName}
+              </p>
+            )}
             <ResponsiveContainer width="100%" height={250}>
               <LineChart data={chartData}>
                 <CartesianGrid strokeDasharray="3 3" />
                 <XAxis dataKey="day" label={{ value: '时间步', position: 'insideBottom', offset: -5 }} fontSize={11} />
-                <YAxis label={{ value: '预测降水距平', angle: -90, position: 'insideLeft' }} fontSize={11} />
+                <YAxis label={{ value: '降水距平 (mm/天)', angle: -90, position: 'insideLeft' }} fontSize={11} />
                 <Tooltip formatter={(value) => Number(value).toFixed(4)} />
-                <Line type="monotone" dataKey="prediction" name="预测值" stroke="#e63946" dot={false} strokeWidth={2} />
+                <Legend />
+                {hasTruthSeries && (
+                  <Line type="monotone" dataKey="truth" name="实况 real2" stroke="#1a478a" dot={false} strokeWidth={2} />
+                )}
+                <Line
+                  type="monotone"
+                  dataKey="prediction"
+                  name="模型预测"
+                  stroke="#e63946"
+                  dot={false}
+                  strokeWidth={2}
+                  strokeDasharray="4 2"
+                />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -560,7 +573,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
                   ref={rCanvasRef}
                   className="prediction-canvas"
                   onClick={handlePearsonCanvasClick}
-                  title="灰色 = 未通过显著性检验；深灰 = 该格点预测恒定、r 无定义"
+                  title="颜色表示 Pearson r；深灰 = 该格点预测恒定、r 无定义"
                 />
               </GeoHeatmapFrame>
               {selectedPearsonGrid && pearson && (() => {
@@ -588,7 +601,6 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
                 <span>r = -1</span>
                 <div className="prediction-gradient" />
                 <span>r = +1</span>
-                <span className="legend-swatch legend-swatch-muted" />未过显著性
                 <span className="legend-swatch legend-swatch-void" />无定义
               </div>
             </div>

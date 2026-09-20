@@ -809,11 +809,37 @@ def prediction_grid_series(
     if not result_path.is_file():
         raise HTTPException(404, "预测结果文件不存在")
     prediction = np.load(result_path, mmap_mode="r", allow_pickle=False)
-    return {
+    response = {
         "i": i,
         "j": j,
         "pred": np.asarray(prediction[i, j, :]).tolist(),
+        "truth": None,
+        "truthName": None,
+        "r": None,
     }
+
+    meta = (job.get("result") or {}).get("verification") or {}
+    truth_path = meta.get("truthPath")
+    if meta.get("available") and truth_path and Path(truth_path).is_file():
+        truth = np.load(truth_path, mmap_mode="r", allow_pickle=False)
+        if truth.shape != prediction.shape:
+            raise HTTPException(
+                409,
+                f"实况场形状 {truth.shape} 与预测场 {prediction.shape} 不一致",
+            )
+        truth_series = np.asarray(truth[i, j, :], dtype=np.float64)
+        response["truth"] = [
+            None if not np.isfinite(value) else float(value)
+            for value in truth_series
+        ]
+        response["truthName"] = meta.get("truthName")
+
+        r_path = _pearson_path(result_path.parent)
+        if r_path.is_file():
+            r_value = float(np.load(r_path, mmap_mode="r", allow_pickle=False)[i, j])
+            response["r"] = r_value if np.isfinite(r_value) else None
+
+    return response
 
 
 @router.get("/jobs/{job_id}/pearson")

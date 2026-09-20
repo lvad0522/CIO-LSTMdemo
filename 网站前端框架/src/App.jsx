@@ -160,7 +160,7 @@ export default function App() {
   const cioDisabled = dataSource === 'default';
 
   return (
-    <div className="app">
+    <div className={`app ${running ? 'is-running' : ''}`}>
       <aside className="sidebar">
         <div className="logo">
           <h1>CIO + LSTM</h1>
@@ -204,7 +204,7 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="main-content">
+      <main className="main-content" aria-busy={running}>
         {error && (
           <div className="error-banner">
             <span>⚠️ {error}</span>

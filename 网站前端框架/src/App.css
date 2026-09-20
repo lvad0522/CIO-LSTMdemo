@@ -6,6 +6,22 @@
   background: #f4f7fa;
 }
 
+/* 运行时主区内容较短，滚轮通常落在主区。让整个工作台承接滚动，
+   避免只有把鼠标移到窄侧栏上才能查看被折叠到视口外的进度和参数。 */
+.app.is-running {
+  align-items: flex-start;
+  overflow-y: auto;
+}
+.app.is-running .sidebar {
+  min-height: 100%;
+  height: max-content;
+  overflow-y: visible;
+}
+.app.is-running .main-content {
+  min-height: 100%;
+  overflow-y: visible;
+}
+
 /* ─── 侧栏 ─── */
 .sidebar {
   width: 290px;
@@ -817,7 +833,6 @@
   border-radius: 2px;
   vertical-align: middle;
 }
-.legend-swatch-muted { background: rgb(240, 240, 240); }
 .legend-swatch-void { background: #2b2b2b; }
 
 /* --- 侧栏里被锁死、不可调的参数 --- */
