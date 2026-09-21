@@ -26,7 +26,12 @@ import live_prediction as prediction
 
 router = APIRouter(prefix="/api/cio", tags=["cio-diagnostics"])
 
-JOB_ROOT = prediction.BACKEND_DIR / "uploads" / "cio_jobs"
+# 可选环境变量覆盖（与 chain.py 的 CHAIN_JOB_ROOT 同形状）：不设 env 时
+# 默认路径**逐字节不变**，旧路由不受影响。
+JOB_ROOT = Path(os.environ.get(
+    "CIO_JOB_ROOT",
+    prediction.BACKEND_DIR / "uploads" / "cio_jobs",
+))
 SUPPORTED_CONFIDENCE = (0.90, 0.95, 0.99)
 SPECTRUM_BLOCK_SIZE = 112
 SPECTRUM_BOOTSTRAP_SAMPLES = 1000

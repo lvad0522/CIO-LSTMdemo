@@ -12,7 +12,9 @@
 跑法:  python test_verification.py
 退出码: 0 = 通过 | 1 = 有断言失败 | 2 = **没有真数据，B 块没验证**（不是通过！）
 """
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -21,6 +23,22 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+
+# ==================================================== 任务根隔离（C-4 同形状 / R5-T2）
+# 跑测试**绝不写**真 `backend/uploads/`。本套件只 import `verification`，本身不建
+# 任务目录；但兄弟模块可能被间接 import，所以两个任务根 env 一律提前设好指向临时区
+# —— **import 之前**设（`live_prediction`/`cio_diagnostics` 都在 import 期求值 JOB_ROOT）。
+# 注：**不**在这里设 TRUTH_DIR —— B 块（A11）用它自己的 TemporaryDirectory 覆盖、
+# C 块则显式 pop 掉要读真 `Dataset/`，模块级设值只会被覆盖，反而模糊意图。
+REAL_UPLOADS = HERE / "uploads"
+TMP_BASE = Path(tempfile.mkdtemp(prefix="r5t2_verification_%d_" % os.getpid()))
+JOB_ROOT = TMP_BASE / "prediction_jobs"
+CIO_JOB_ROOT = TMP_BASE / "cio_jobs"
+for _d in (JOB_ROOT, CIO_JOB_ROOT):
+    _d.mkdir(parents=True, exist_ok=True)
+os.environ["PREDICTION_JOB_ROOT"] = str(JOB_ROOT)
+os.environ["CIO_JOB_ROOT"] = str(CIO_JOB_ROOT)
+atexit.register(shutil.rmtree, TMP_BASE, ignore_errors=True)   # 异常/提前退出也清理
 
 import verification as V                            # noqa: E402
 
@@ -33,6 +51,96 @@ def check(cond, label, detail=""):
     if not cond:
         FAILS.append(label)
     return cond
+
+
+# ------------------------------------------------ 真工作区零写入的自检装置
+REAL_JOB_DIRS = (REAL_UPLOADS / "chain_jobs",
+                 REAL_UPLOADS / "prediction_jobs",
+                 REAL_UPLOADS / "cio_jobs")
+
+
+def _inside(path, base):
+    """`path` 是否（严格地）落在 `base` 之下。"""
+    try:
+        Path(path).resolve().relative_to(Path(base).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+# 守卫：两个任务根 env 必须都落在临时区，否则不许继续（env 没生效就会命中）。
+_LEAKED = [("%s=%s" % (name, root))
+           for name, root in (("PREDICTION_JOB_ROOT", JOB_ROOT),
+                              ("CIO_JOB_ROOT", CIO_JOB_ROOT))
+           if any(_inside(root, real) for real in REAL_JOB_DIRS)]
+if _LEAKED:
+    print("⚠  任务根没隔离到临时区，自检会往真工作区里写文件：")
+    for _d in _LEAKED:
+        print("     %s" % _d)
+    print("   拒绝继续（C-4）—— 这不是通过。")
+    sys.exit(2)
+
+
+def _snapshot_tree(base):
+    """目录名全集 + 各条目 mtime + **根目录 mtime**（见兄弟套件同名函数说明）。"""
+    plain = str(base)
+    if not base.is_dir():
+        return {"key": plain, "exists": False, "root_mtime": None, "entries": {}}
+    entries = {}
+    for path in sorted(base.rglob("*")):
+        try:
+            entries[str(path)] = path.stat().st_mtime
+        except OSError:
+            continue
+    try:
+        root_mtime = base.stat().st_mtime
+    except OSError:
+        root_mtime = None
+    return {"key": plain, "exists": True, "root_mtime": root_mtime,
+            "entries": entries}
+
+
+def _no_write_diff(before, after):
+    """比对跑前/跑后快照，返回 (是否零差异, 差异描述)。"""
+    if before.get("exists") != after.get("exists"):
+        return False, "存在性变了：%r -> %r" % (before["exists"], after["exists"])
+    if not before.get("exists"):
+        return True, "目录本就不存在（无既有件，亦未新建）"
+    b, a = before["entries"], after["entries"]
+    parts = []
+    stale = sorted(set(b) - set(a))
+    fresh = sorted(set(a) - set(b))
+    touched = [p for p in sorted(set(b) & set(a)) if b[p] != a[p]]
+    if stale:
+        parts.append("%d 个条目被删：%s" % (len(stale), stale[:3]))
+    if fresh:
+        parts.append("%d 个条目新增：%s" % (len(fresh), fresh[:3]))
+    if touched:
+        parts.append("%d 个条目 mtime 被改：%s" % (len(touched), touched[:3]))
+    if before.get("root_mtime") != after.get("root_mtime"):
+        parts.append("根目录 mtime 变了（建了又删？）")
+    return (not parts), ("；".join(parts) if parts else "无差异")
+
+
+REAL_SNAPSHOT_BEFORE = {str(d): _snapshot_tree(d) for d in REAL_JOB_DIRS}
+
+
+def _final_isolation_selfcheck():
+    """末置自检（C-4 同形状）：真工作区 uploads/ 本轮零写入，**进退出判定**。
+
+    两条出口（"没真数据 → 2" 与正常收尾）都要调用它 —— 但必须在算退出码**之前**
+    调：自检失败会往 FAILS 里追加，于是那条出口判成 1（真失败）而不是 2（没验证）。
+    """
+    print("  隔离自检（C-4）：任务根在临时区，不写 backend/uploads/")
+    print("    任务根 PREDICTION_JOB_ROOT -> %s" % os.environ.get("PREDICTION_JOB_ROOT"))
+    print("    任务根 CIO_JOB_ROOT        -> %s" % os.environ.get("CIO_JOB_ROOT"))
+    print("    真工作区（仓库内）          -> %s" % REAL_UPLOADS)
+    check(_inside(JOB_ROOT, TMP_BASE) and _inside(CIO_JOB_ROOT, TMP_BASE),
+          "两个任务根都在本进程临时区（env 覆盖到位）", TMP_BASE)
+    for _real in REAL_JOB_DIRS:
+        _ok, _why = _no_write_diff(REAL_SNAPSHOT_BEFORE[str(_real)],
+                                   _snapshot_tree(_real))
+        check(_ok, "真工作区 %s 本轮一个字节都没被写" % _real.name, _why)
 
 
 print("test_verification: 技巧检验自检")
@@ -159,6 +267,7 @@ if truth is None or not live.is_file():
     print("!!   产出: 在线推理产出/live_pre1_2000.npy")
     print("!" * 78)
     print("A/B 块结果:", "全部通过" if not FAILS else "有失败: %s" % FAILS)
+    _final_isolation_selfcheck()          # 必须在算退出码之前（自检失败 -> 1，不是 2）
     sys.exit(1 if FAILS else 2)
 
 pred = np.load(live)
@@ -192,4 +301,5 @@ for key in ("confidence", "criticalR", "meanR", "medianR", "minR", "maxR",
 
 print("=" * 78)
 print("判定:", "全部通过" if not FAILS else "有失败: %s" % FAILS)
+_final_isolation_selfcheck()
 sys.exit(0 if not FAILS else 1)

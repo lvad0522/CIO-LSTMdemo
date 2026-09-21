@@ -11,10 +11,12 @@
 
 跑法:  python test_predict_chain.py
 """
+import atexit
 import io
 import os
 import shutil
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -24,6 +26,20 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+# ==================================================== 任务根隔离（C-4 同形状 / R5-T2）
+# 跑测试**绝不写**真 `backend/uploads/`：任务根与实况根一律指向本进程专属临时区。
+# `live_prediction.JOB_ROOT` 是 **import 期求值**（lp:58-61），env 必须在下面那行
+# `import live_prediction` **之前**设好 —— 运行期再改模块属性补不住 import 期派生值。
+REAL_UPLOADS = HERE / "uploads"
+TMP_BASE = Path(tempfile.mkdtemp(prefix="r5t2_predict_chain_%d_" % os.getpid()))
+JOB_ROOT = TMP_BASE / "prediction_jobs"           # 旧 `/api/predict` 的任务目录
+TRUTH_ROOT = TMP_BASE / "truth"                   # 实况场目录
+for _d in (JOB_ROOT, TRUTH_ROOT):
+    _d.mkdir(parents=True, exist_ok=True)
+os.environ["PREDICTION_JOB_ROOT"] = str(JOB_ROOT)
+os.environ["TRUTH_DIR"] = str(TRUTH_ROOT)
+atexit.register(shutil.rmtree, TMP_BASE, ignore_errors=True)   # 异常/跳过路径也清理
 
 import live_prediction as lp                        # noqa: E402
 
@@ -36,6 +52,83 @@ def check(cond, label, detail=""):
     if not cond:
         FAILS.append(label)
     return cond
+
+
+# ------------------------------------------------ 真工作区零写入的自检装置
+# 三个任务库一个字节都不许写（R5-T2：`cio_jobs` 也是泄漏口，c4_snapshot 旧版只看两个）。
+REAL_JOB_DIRS = (REAL_UPLOADS / "chain_jobs",
+                 REAL_UPLOADS / "prediction_jobs",
+                 REAL_UPLOADS / "cio_jobs")
+
+
+def _inside(path, base):
+    """`path` 是否（严格地）落在 `base` 之下。"""
+    try:
+        Path(path).resolve().relative_to(Path(base).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+# 守卫用的是**模块内实际求出的** JOB_ROOT（不是本文件的局部变量）：env 若没生效，
+# 这里就会命中，直接拒绝继续 —— 不许"隔离失败还照样跑"。
+_LEAKED = [root for root in (lp.JOB_ROOT,)
+           if any(_inside(root, real) for real in REAL_JOB_DIRS)]
+if _LEAKED:
+    print("⚠  任务根没隔离到临时区，自检会往真工作区里写文件：")
+    for _d in _LEAKED:
+        print("     %s" % _d)
+    print("   拒绝继续（C-4）—— 这不是通过。")
+    sys.exit(2)
+
+
+def _snapshot_tree(base):
+    """目录名全集 + 各条目 mtime + **根目录 mtime**。
+
+    根 mtime 是关键：没有它，"建一个目录又把它删掉"在前后快照里看不出差别
+    （名字集合与 mtime 都恢复原状），而真工作区恰恰会被这种手法悄悄碰过。
+    """
+    plain = str(base)
+    if not base.is_dir():
+        return {"key": plain, "exists": False, "root_mtime": None, "entries": {}}
+    entries = {}
+    for path in sorted(base.rglob("*")):
+        try:
+            entries[str(path)] = path.stat().st_mtime
+        except OSError:                        # 竞态下目录可能刚被移走
+            continue
+    try:
+        root_mtime = base.stat().st_mtime
+    except OSError:
+        root_mtime = None
+    return {"key": plain, "exists": True, "root_mtime": root_mtime,
+            "entries": entries}
+
+
+def _no_write_diff(before, after):
+    """比对跑前/跑后快照，返回 (是否零差异, 差异描述)。"""
+    if before.get("exists") != after.get("exists"):
+        return False, "存在性变了：%r -> %r" % (before["exists"], after["exists"])
+    if not before.get("exists"):
+        return True, "目录本就不存在（无既有件，亦未新建）"
+    b, a = before["entries"], after["entries"]
+    parts = []
+    stale = sorted(set(b) - set(a))
+    fresh = sorted(set(a) - set(b))
+    touched = [p for p in sorted(set(b) & set(a)) if b[p] != a[p]]
+    if stale:
+        parts.append("%d 个条目被删：%s" % (len(stale), stale[:3]))
+    if fresh:
+        parts.append("%d 个条目新增：%s" % (len(fresh), fresh[:3]))
+    if touched:
+        parts.append("%d 个条目 mtime 被改：%s" % (len(touched), touched[:3]))
+    if before.get("root_mtime") != after.get("root_mtime"):
+        parts.append("根目录 mtime 变了（建了又删？）")
+    return (not parts), ("；".join(parts) if parts else "无差异")
+
+
+# 跑前快照：这之后才是全部用例体
+REAL_SNAPSHOT_BEFORE = {str(d): _snapshot_tree(d) for d in REAL_JOB_DIRS}
 
 
 def find_fixture():
@@ -145,11 +238,9 @@ else:
     os.environ["CIOPROJ_MAT"] = str(MAT)
     os.environ["CIOPROJ_ALLOW_MOCK"] = "1"         # 夹具件只在本机联调里放行
 
-    # 实况场指向受控临时目录：技巧检验的断言不能取决于本机有没有 Dataset/
-    TRUTH_ROOT = HERE / "_tmp_truth"
-    shutil.rmtree(TRUTH_ROOT, ignore_errors=True)
-    (TRUTH_ROOT / "pre1" / "2000").mkdir(parents=True)
-    os.environ["TRUTH_DIR"] = str(TRUTH_ROOT)
+    # 实况场指向受控临时目录（模块顶部已建好并出口到 TRUTH_DIR）：技巧检验的断言
+    # 不能取决于本机有没有 Dataset/。这里只需把 pre1/2000 建出来（起始为空）。
+    (TRUTH_ROOT / "pre1" / "2000").mkdir(parents=True, exist_ok=True)
 
     app = FastAPI()
     app.include_router(lp.router)
@@ -394,8 +485,22 @@ else:
     finally:
         lp._run_archive_inference = real_inference
         shutil.rmtree(HERE / "_tmp_extract", ignore_errors=True)
-        shutil.rmtree(TRUTH_ROOT, ignore_errors=True)
+        shutil.rmtree(TMP_BASE, ignore_errors=True)
         os.environ.pop("TRUTH_DIR", None)
+        os.environ.pop("PREDICTION_JOB_ROOT", None)
+
+# ---- 末置自检（C-4 同形状）：真工作区 uploads/ 本轮零写入，**进退出判定** ----
+print("  隔离自检（C-4）：任务根在临时区，不写 backend/uploads/")
+print("    任务根 PREDICTION_JOB_ROOT -> %s" % lp.JOB_ROOT)
+print("    实况根 TRUTH_ROOT          -> %s" % TRUTH_ROOT)
+print("    真工作区（仓库内）          -> %s" % REAL_UPLOADS)
+check(str(lp.JOB_ROOT) == str(JOB_ROOT),
+      "PREDICTION_JOB_ROOT 环境覆盖确实生效（任务根落在临时区）",
+      (str(lp.JOB_ROOT), str(JOB_ROOT)))
+for _real in REAL_JOB_DIRS:
+    _ok, _why = _no_write_diff(REAL_SNAPSHOT_BEFORE[str(_real)],
+                               _snapshot_tree(_real))
+    check(_ok, "真工作区 %s 本轮一个字节都没被写" % _real.name, _why)
 
 print("=" * 78)
 if FAILS:

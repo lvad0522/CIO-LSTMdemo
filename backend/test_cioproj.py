@@ -19,20 +19,137 @@
 跑法:  python test_cioproj.py
 退出码: 0 = 通过 | 1 = 有不一致 | 2 = **没找到任何数据，什么都没验证**（不是通过！）
 """
+import atexit
 import os
+import shutil
 import sys
+import tempfile
+from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+# ==================================================== 任务根隔离（C-4 同形状 / R5-T2）
+# 本套件只算投影、本身不建任务目录；但两个任务根 env 一律**在 import 之前**设好指向
+# 本进程专属临时区 —— 免得将来有人在这里加一条建任务的路径就又开始往真
+# `backend/uploads/` 里倒桩产物。
+REAL_UPLOADS = Path(HERE) / "uploads"
+TMP_BASE = Path(tempfile.mkdtemp(prefix="r5t2_cioproj_%d_" % os.getpid()))
+JOB_ROOT = TMP_BASE / "prediction_jobs"
+CIO_JOB_ROOT = TMP_BASE / "cio_jobs"
+TRUTH_ROOT = TMP_BASE / "truth"
+for _d in (JOB_ROOT, CIO_JOB_ROOT, TRUTH_ROOT):
+    _d.mkdir(parents=True, exist_ok=True)
+os.environ["PREDICTION_JOB_ROOT"] = str(JOB_ROOT)
+os.environ["CIO_JOB_ROOT"] = str(CIO_JOB_ROOT)
+os.environ["TRUTH_DIR"] = str(TRUTH_ROOT)
+atexit.register(shutil.rmtree, TMP_BASE, ignore_errors=True)   # 异常/提前退出也清理
+
 import cioproj                                     # noqa: E402
+
+# ------------------------------------------------ 真工作区零写入的自检装置
+REAL_JOB_DIRS = (REAL_UPLOADS / "chain_jobs",
+                 REAL_UPLOADS / "prediction_jobs",
+                 REAL_UPLOADS / "cio_jobs")
+
+
+def _inside(path, base):
+    """`path` 是否（严格地）落在 `base` 之下。"""
+    try:
+        Path(path).resolve().relative_to(Path(base).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+# 守卫：两个任务根 env 必须都落在临时区，否则不许继续（env 没生效就会命中）。
+_LEAKED = [("%s=%s" % (name, root))
+           for name, root in (("PREDICTION_JOB_ROOT", JOB_ROOT),
+                              ("CIO_JOB_ROOT", CIO_JOB_ROOT))
+           if any(_inside(root, real) for real in REAL_JOB_DIRS)]
+if _LEAKED:
+    print("⚠  任务根没隔离到临时区，自检会往真工作区里写文件：")
+    for _d in _LEAKED:
+        print("     %s" % _d)
+    print("   拒绝继续（C-4）—— 这不是通过。")
+    sys.exit(2)
+
+
+def _snapshot_tree(base):
+    """目录名全集 + 各条目 mtime + **根目录 mtime**（见兄弟套件同名函数说明）。"""
+    plain = str(base)
+    if not base.is_dir():
+        return {"key": plain, "exists": False, "root_mtime": None, "entries": {}}
+    entries = {}
+    for path in sorted(base.rglob("*")):
+        try:
+            entries[str(path)] = path.stat().st_mtime
+        except OSError:
+            continue
+    try:
+        root_mtime = base.stat().st_mtime
+    except OSError:
+        root_mtime = None
+    return {"key": plain, "exists": True, "root_mtime": root_mtime,
+            "entries": entries}
+
+
+def _no_write_diff(before, after):
+    """比对跑前/跑后快照，返回 (是否零差异, 差异描述)。"""
+    if before.get("exists") != after.get("exists"):
+        return False, "存在性变了：%r -> %r" % (before["exists"], after["exists"])
+    if not before.get("exists"):
+        return True, "目录本就不存在（无既有件，亦未新建）"
+    b, a = before["entries"], after["entries"]
+    parts = []
+    stale = sorted(set(b) - set(a))
+    fresh = sorted(set(a) - set(b))
+    touched = [p for p in sorted(set(b) & set(a)) if b[p] != a[p]]
+    if stale:
+        parts.append("%d 个条目被删：%s" % (len(stale), stale[:3]))
+    if fresh:
+        parts.append("%d 个条目新增：%s" % (len(fresh), fresh[:3]))
+    if touched:
+        parts.append("%d 个条目 mtime 被改：%s" % (len(touched), touched[:3]))
+    if before.get("root_mtime") != after.get("root_mtime"):
+        parts.append("根目录 mtime 变了（建了又删？）")
+    return (not parts), ("；".join(parts) if parts else "无差异")
+
+
+# 跑前快照：这之后才是全部用例体
+REAL_SNAPSHOT_BEFORE = {str(d): _snapshot_tree(d) for d in REAL_JOB_DIRS}
+
+
+def _final_isolation_selfcheck():
+    """末置自检（C-4 同形状）：真工作区 uploads/ 本轮零写入，**进退出判定**。
+
+    两条出口（"没数据 → 2" 与正常收尾）都要调用；失败时返回 False，由调用方把
+    退出码落到 1（真失败）而不是 2（没验证）或 0（通过）。
+    """
+    print("  隔离自检（C-4）：任务根在临时区，不写 backend/uploads/")
+    print("    PREDICTION_JOB_ROOT -> %s" % os.environ.get("PREDICTION_JOB_ROOT"))
+    print("    CIO_JOB_ROOT        -> %s" % os.environ.get("CIO_JOB_ROOT"))
+    print("    TRUTH_DIR           -> %s" % os.environ.get("TRUTH_DIR"))
+    print("    真工作区（仓库内）    -> %s" % REAL_UPLOADS)
+    good = True
+    if not (_inside(JOB_ROOT, TMP_BASE) and _inside(CIO_JOB_ROOT, TMP_BASE)
+            and _inside(TRUTH_ROOT, TMP_BASE)):
+        print("  [!!] 任务根/实况根没落在本进程临时区")
+        good = False
+    for real in REAL_JOB_DIRS:
+        okk, why = _no_write_diff(REAL_SNAPSHOT_BEFORE[str(real)],
+                                  _snapshot_tree(real))
+        print("  [%s] 真工作区 %s 本轮一个字节都没被写%s"
+              % ("OK" if okk else "!!", real.name, "" if okk else "   <- " + why))
+        good = good and okk
+    return good
 
 BAD_LEAD = 7                    # 服务器上爆掉的那一年
 CORR_MIN = 0.999999             # 逐点一致要求的相关
 REL_MAX = 1e-5                  # 最大差 / 金标准 std
 LEADS = list(range(1, 21))
-
-HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _first_dir(cands, probe):
@@ -93,8 +210,9 @@ else:
         print("   真数据: 摸库交付_2026-09-15/数据/   可用 CIOPROJ_REAL 指定")
         print("   夹具  : 摸库交付_2026-09-15/03_夹具/ 可用 CIOPROJ_FIXTURE 指定")
         print("=" * 78)
+        _iso_ok = _final_isolation_selfcheck()
         print("判定: 跳过（退出码 2 —— 这不是通过）")
-        sys.exit(2)
+        sys.exit(2 if _iso_ok else 1)
 
 print("数据根 =", ROOT)
 NC = os.path.join(ROOT, "U850")
@@ -157,5 +275,7 @@ try:
 except NotImplementedError as exc:
     print("按预期拒绝：", str(exc)[:40], "...")
 
+if not _final_isolation_selfcheck():
+    ok = False
 print("退出码 =", 0 if ok else 1)
 sys.exit(0 if ok else 1)
