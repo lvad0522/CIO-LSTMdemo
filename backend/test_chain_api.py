@@ -1048,6 +1048,15 @@ try:
         check(r.status_code == 200 and r.json()["rows"] == 81,
               "链路 /truth/preview 仍然 200（B-3 最容易改崩的点）",
               "%s %s" % (r.status_code, r.text[:120]))
+        r = client.get("%s/%s/grid?i=40&j=50" % (CHAIN_PREFIX, job["jobId"]))
+        grid = r.json()
+        check(r.status_code == 200 and len(grid["pred"]) == 112
+              and len(grid["truth"]) == 112,
+              "链路格点端点同时返回 112 步预测与 real2 实况", r.status_code)
+        check(grid["pred"] == grid["truth"] and grid["truthName"] == truth_file,
+              "链路格点实况来自本任务已校验的 real2 文件", grid.get("truthName"))
+        check(grid["r"] is not None and abs(grid["r"] - 1.0) < 1e-6,
+              "链路格点端点返回同口径 Pearson r", grid["r"])
         r = client.get("%s/%s/download/pearson" % (CHAIN_PREFIX, job["jobId"]))
         check(r.status_code == 200, "download/pearson 可下载", r.status_code)
 
@@ -1077,6 +1086,18 @@ try:
         check(r.status_code == 200 and r.json()["rows"] == 81,
               "旧路由 /truth/preview 仍然 200（改崩这里就是 409）",
               "%s %s" % (r.status_code, r.text[:120]))
+        r = legacy_client.get("/api/predict/jobs/%s/grid?i=40&j=50"
+                              % legacy_truth_job["jobId"])
+        legacy_grid = r.json()
+        check(r.status_code == 200 and len(legacy_grid["pred"]) == 112
+              and len(legacy_grid["truth"]) == 112,
+              "旧路由格点端点同时返回 112 步预测与 real2 实况", r.status_code)
+        check(legacy_grid["pred"] == legacy_grid["truth"]
+              and legacy_grid["truthName"] == truth_file,
+              "旧路由格点实况来自本任务已校验的 real2 文件",
+              legacy_grid.get("truthName"))
+        check(legacy_grid["r"] is not None and abs(legacy_grid["r"] - 1.0) < 1e-6,
+              "旧路由格点端点返回同口径 Pearson r", legacy_grid["r"])
         shutil.rmtree(lp.JOB_ROOT / legacy_truth_job["jobId"], ignore_errors=True)
         (day / truth_file).unlink(missing_ok=True)
 

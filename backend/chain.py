@@ -733,13 +733,39 @@ def chain_grid_series(
     i: int = Query(40, ge=0, lt=prediction.GRID_ROWS),
     j: int = Query(50, ge=0, lt=prediction.GRID_COLS),
 ):
-    _job, path = _require_prediction(job_id)
+    job, path = _require_prediction(job_id)
     prediction_array = np.load(path, mmap_mode="r", allow_pickle=False)
-    return {
+    response = {
         "i": i,
         "j": j,
         "pred": np.asarray(prediction_array[i, j, :]).tolist(),
+        "truth": None,
+        "truthName": None,
+        "r": None,
     }
+
+    meta = (job.get("result") or {}).get("verification") or {}
+    truth_path = job.get("truthFile")
+    if meta.get("available") and truth_path and Path(truth_path).is_file():
+        truth = np.load(truth_path, mmap_mode="r", allow_pickle=False)
+        if truth.shape != prediction_array.shape:
+            raise HTTPException(
+                409,
+                f"实况场形状 {truth.shape} 与预测场 {prediction_array.shape} 不一致",
+            )
+        truth_series = np.asarray(truth[i, j, :], dtype=np.float64)
+        response["truth"] = [
+            None if not np.isfinite(value) else float(value)
+            for value in truth_series
+        ]
+        response["truthName"] = meta.get("truthName")
+
+        r_path = _pearson_path(path.parent)
+        if r_path.is_file():
+            r_value = float(np.load(r_path, mmap_mode="r", allow_pickle=False)[i, j])
+            response["r"] = r_value if np.isfinite(r_value) else None
+
+    return response
 
 
 @router.get("/jobs/{job_id}/pearson")
