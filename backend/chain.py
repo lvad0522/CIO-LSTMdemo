@@ -195,8 +195,11 @@ def _require_prediction(job_id: str) -> tuple[dict, Path]:
 
 
 def _truth_path(job: dict) -> Path:
+    # C-2/B-3：实况路径读**任务顶层** `truthFile`（进程内字段，不在 `_PUBLIC_FIELDS`
+    # 里，所以进不了响应）。别再回 `result.verification.truthPath` 读 —— 那个键
+    # 已按 PM 口径在调用点摘除，读它等于两条 truth/preview 一起 409。
     meta = (job.get("result") or {}).get("verification") or {}
-    truth_path = meta.get("truthPath")
+    truth_path = job.get("truthFile")
     if not truth_path or not Path(truth_path).is_file():
         raise HTTPException(409, meta.get("reason") or "该任务没有可用的实况场")
     return Path(truth_path)
@@ -451,6 +454,9 @@ def _run_stage3(job_id: str, job_dir: Path, lead: str, year: int) -> None:
     verification = prediction._verify_against_truth(
         prediction_array, job_dir, job_id, {"lead": lead, "year": year}
     )
+    # C-2/B-3：实况文件的绝对路径**只留在进程内**（下面的 `truthFile`），摘出来
+    # 再进 `result.verification` —— 那份 result 会经 `_public_job()` 出去。
+    truth_file = verification.pop("truthPath", None)
     # 检验与预测是同一份实况对照，下载路径由本文件统一指向链路前缀（design D7）
     if verification.get("available"):
         verification["downloadUrl"] = (
@@ -469,6 +475,7 @@ def _run_stage3(job_id: str, job_dir: Path, lead: str, year: int) -> None:
             "downloadUrl": f"/api/chain/jobs/{job_id}/download/prediction",
             "verification": verification,
         },
+        truthFile=truth_file,
     )
 
 
@@ -521,13 +528,16 @@ def _run_chain_job(job_id: str, projection: dict, only_projection: bool,
         )
     except Exception as exc:  # 后台线程必须把错误保存给前端
         finished = time.time()
+        # 总闸：同旧路由，`error` 的文本会进响应并被前端上屏。净化器与旧路由
+        # **共用同一个** `prediction._safe_exc`，不另写一份（口径分叉的老路）。
+        # 覆盖范围只限执行路径；受理路径未纳入（见 `_safe_exc` docstring）。
         _update_job(
             job_id,
             status="failed",
             stage="链路失败",
             finishedAt=finished,
             durationSeconds=round(finished - started, 2),
-            error=f"{type(exc).__name__}: {exc}",
+            error=prediction._safe_exc(exc),
         )
 
 

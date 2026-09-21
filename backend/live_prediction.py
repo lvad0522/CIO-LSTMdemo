@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import os
 import re
@@ -114,6 +115,49 @@ def _update_job(job_id: str, **changes) -> None:
             _jobs[job_id].update(changes)
 
 
+def _safe_exc(exc: BaseException) -> str:
+    """异常 → 可进响应的短串，绝不带绝对路径。
+
+    带 `.filename` 的异常（`FileNotFoundError` 等 `OSError` 家族）把**服务器绝对
+    路径**放在两个地方：`str(exc)` 里和 `exc.filename` 里。异常文本会经
+    `error=` / `verification.reason` 直接进响应，`error` 还会被前端**上屏**
+    （见 R3-4）。所以带 `.filename` 时只保留**文件名**。
+
+    不带 `.filename` 的一律原样返回 `str(exc)` —— 最有用的诊断信息全在这条
+    else 上：形状不一致（"预测场形状 (5, 5, 5) 与实况场 (3, 3, 3) 不一致"）、
+    npy 损坏（"Cannot parse header: ''"）、0 字节（"No data left in file"）。
+    无条件套 `[Errno None] None` 会把它们全毁掉。
+
+    ⚠ `.filename` **可能是 None**（实测 `OSError(ENOMEM)`：errno 有、filename
+    没有），也可能是 bytes 或 int 文件描述符 —— `os.fsdecode` 只吃
+    str/bytes/PathLike，其余按"没有文件名"处理，别让它把异常吞成 TypeError。
+
+    **覆盖范围（别扩大理解）**：本净化器只处理"异常自带 `.filename`"这一类。
+    用点三处：执行路径上新旧两条路由**各一个**总闸（`_run_job` /
+    `chain._run_chain_job`）+ 实况检验的 reason。**受理/校验路径**另有约 11
+    处 `str(exc)` 出口**未纳入**，其中 `chain._mat_identity(required=False)` 的
+    `matUnavailable: str(exc)` 是直接进响应体的，实测（把 `CIOPROJ_MAT` 指向
+    不存在的路径 → POST 一个 `.npy`）202 响应里带出 `.mat` 的绝对路径 —— 与
+    R3-4 同一类，属遗留项，本轮按 PM 口径不扩改动面。
+    另外，**我们自己 `raise` 的、把路径写进 message 的异常**必须填 `.filename`：
+    单参 `FileNotFoundError(f"...{PATH}")` 的 `.filename` 是 None，会走下面的
+    else 原样吐出。本轮已把 `_run_archive_inference` 的"模型压缩包不存在"
+    改成三参形式，D3 有用例钉住（改造前实测：error 里带出模型包绝对路径，
+    且该串前端上屏）。以后再 `raise` 带路径的 `OSError`，照此办理。
+    """
+    name = getattr(exc, "filename", None)
+    if name:
+        try:
+            name = os.fsdecode(name)
+        except (TypeError, ValueError):     # int fd / 其它怪东西
+            name = None
+        if name:
+            errno_ = getattr(exc, "errno", None)
+            head = f"[Errno {errno_}] " if errno_ is not None else ""
+            return f"{head}{type(exc).__name__}: {os.path.basename(name)}"
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _prepare_cio(
     raw: np.ndarray, pre_year: int = 0
 ) -> tuple[np.ndarray, dict]:
@@ -203,19 +247,18 @@ def _mat_meta() -> dict:
     path = _mat_path()
     if not path.is_file():
         raise ValueError(
-            f"缺少 CIO 模态资产 {path} —— 原始场投影必需。请把服务器上的 "
-            "/mnt/mydisk2/zxy/data/rain/CIOmode_1982_2017.mat 放到 "
-            "backend/assets/ 下，或用环境变量 CIOPROJ_MAT 指定路径。"
+            f"缺少 CIO 模态资产 {path.name} —— 原始场投影必需。请把服务器上的 "
+            "原始件放到 backend/assets/ 下，或用环境变量 CIOPROJ_MAT 指定路径。"
         )
     try:
         import scipy.io as sio
 
         mat = sio.loadmat(str(path))
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"读不了 CIO 模态资产 {path}: {exc!r}") from exc
+        raise ValueError(f"读不了 CIO 模态资产 {path.name}: {exc!r}") from exc
 
     if "e" not in mat:
-        raise ValueError(f"CIO 模态资产 {path} 里没有变量 e")
+        raise ValueError(f"CIO 模态资产 {path.name} 里没有变量 e")
     e = np.asarray(mat["e"], dtype=np.float64)
     if e.ndim != 2 or e.shape != MAT_SHAPE:
         raise ValueError(f"CIO 模态 e 形状 {e.shape}，期望 {MAT_SHAPE}")
@@ -227,29 +270,28 @@ def _mat_meta() -> dict:
     if sandbox is not None:
         if not mock_sandbox.allow_flag_set():
             raise ValueError(
-                f"CIO 模态资产 {path} 在模拟数据沙盒 {sandbox} 里 —— 那是 "
+                f"CIO 模态资产 {path.name} 在模拟数据沙盒 {sandbox.name} 里 —— 那是 "
                 "make_mock.py 造的假数据，不对应任何真实观测。"
                 "正式跑请用服务器真件（backend/assets/ 或 摸库交付_2026-09-15/数据/）；"
                 f"确实要用它做联调，显式设 {mock_sandbox.ALLOW_ENV}=1。"
             )
         return {
             "matSource": "mock",
-            "matPath": str(path),
-            "sandboxRoot": str(sandbox),
+            "matPath": path.name,
             "orthoDeviation": deviation,
         }
 
     # 沙盒外：必须是真的。ALLOW_MOCK 在这里不构成放行。
     if deviation > MAT_ORTHO_TOL:
         raise ValueError(
-            f"CIO 模态资产 {path} 不是服务器真件（e·eᵀ 偏离单位阵 {deviation:.3g} "
+            f"CIO 模态资产 {path.name} 不是服务器真件（e·eᵀ 偏离单位阵 {deviation:.3g} "
             f"> {MAT_ORTHO_TOL:g}）。它也不在模拟数据沙盒里，所以 "
             f"{mock_sandbox.ALLOW_ENV} 对它无效 —— 沙盒外的资产必须是真的。"
             "假数据请放进带 .MOCK_SANDBOX 标记的目录。"
         )
     return {
         "matSource": "real",
-        "matPath": str(path),
+        "matPath": path.name,
         "orthoDeviation": deviation,
     }
 
@@ -477,6 +519,53 @@ def _build_model(torch, checkpoint: dict):
     return RNN()
 
 
+class _permanent_safe_globals:
+    """装上就**永不摘除**的 `torch.serialization.safe_globals` 等价物。
+
+    **为什么不能用 torch 自带的那一个（B-8，2026-09-21 定为 open P0）**：
+    `torch.serialization.safe_globals` 的 `__exit__` 无条件执行
+    `_remove_safe_globals(self.safe_globals)`，而底层
+    `torch._weights_only_unpickler._marked_safe_globals_set` 是**进程级单例**、
+    **没有引用计数**。本模块把整个 8181 循环包在它的 `with` 里，而同一个 uvicorn
+    进程里可以并发跑两个任务（新链 `chain.py` 与旧路由各自 `max_workers=1`，
+    但**共享一个进程**）—— **先退出的那个会把
+    `numpy._core.multiarray.scalar` 从全局集合里摘掉**，另一个还在循环里，
+    于是 `torch.load` 跑到一半抛 `UnpicklingError`。
+    实测（`.harness/tmp/site-chain/test4/b8_repro_integration.py`，B 落后 A 15 秒
+    启动）：B 崩在 **5500/8181**，traceback 落在下面的 `torch.load`。
+
+    ⚠ **不要"把 `with` 收窄到只包住 `torch.load`"** —— 那只是把 60 秒的竞争
+    窗口缩成几毫秒，**竞争依然存在，只是更难撞上**；而"跑一百次好一次坏"恰好是
+    事后最难发现的那类 bug，答辩现场撞一次就是事故。
+    本类的做法是把"摘除"这一步**整个去掉**：
+    `torch.serialization.add_safe_globals()` 底层是并集运算
+    （`_marked_safe_globals_set = _marked_safe_globals_set.union(...)`），幂等；
+    装上去之后**进程内没有任何路径会摘掉它**，全局集合单调不减 → 并发退出摘不掉
+    别人的 allowlist → **竞争消除**。这是单调性论证，与线程调度时序无关，
+    不像"收窄窗口"那样只是把概率调小。另：别的库若用自带 CM 装自己的类型，
+    其 `__exit__` 也只摘**它自己列的那几个**，摘不到这 4 个。
+
+    **代价（进程级永久放行，已评估接受）**：这 4 个类型是
+    `numpy._core.multiarray.scalar` / `np.dtype` / `np.dtype[float64]` /
+    `np.dtype[float32]` —— **都是数据类型，不是可调用对象**，反序列化它们不产生
+    任意代码执行。且本仓库**没有任何"载入不可信 pickle"的路径**：`MODEL_ARCHIVE`
+    是本地固定资产，用户上传走 `.nc`（`.zip` 解压后）与
+    `np.load(..., allow_pickle=False)`，都不经过 `torch.load`。
+    """
+
+    def __init__(self, torch_module, types):
+        self._torch = torch_module
+        self._types = list(types)
+
+    def __enter__(self):
+        # 幂等：重复进入只是再做一次并集，不产生副作用。
+        self._torch.serialization.add_safe_globals(self._types)
+        return self
+
+    def __exit__(self, *_exc):
+        return False        # 故意**不**摘除 —— 理由见类文档
+
+
 def _run_archive_inference(
     cio: np.ndarray,
     progress_callback=None,
@@ -487,7 +576,10 @@ def _run_archive_inference(
     `span` 是进度条区间：投影阶段占掉前面一段，推理从 span[0] 推到 span[1]。
     """
     if not MODEL_ARCHIVE.is_file():
-        raise FileNotFoundError(f"模型压缩包不存在: {MODEL_ARCHIVE}")
+        # 三参形式：单参 `FileNotFoundError(f"...{MODEL_ARCHIVE}")` 的 `.filename`
+        # 是 None，`_safe_exc` 会走 else 原样吐出绝对路径（这个 error 串前端上屏，
+        # R3-4）。填了 filename 才让总闸真正生效。
+        raise FileNotFoundError(errno.ENOENT, "模型压缩包不存在", str(MODEL_ARCHIVE))
 
     # 当前 Windows/Anaconda 环境的 NumPy 与 PyTorch 可能各自携带 OpenMP。
     # 这是本地验证兼容设置；后续部署应统一运行时依赖后移除。
@@ -520,7 +612,10 @@ def _run_archive_inference(
     if progress_callback:
         progress_callback(span[0], "正在打开模型压缩包")
 
-    with torch.serialization.safe_globals(safe_types):
+    # ⚠ 为什么不是 `with torch.serialization.safe_globals(safe_types)`：见上面
+    # `_permanent_safe_globals` 的类文档（B-8：那个 CM 退出时无条件摘除全局
+    # allowlist，并发双任务必挂）。
+    with _permanent_safe_globals(torch, safe_types):
         with tarfile.open(MODEL_ARCHIVE, mode="r|gz") as archive:
             for member in archive:
                 if not member.isfile() or not member.name.endswith(".pt"):
@@ -599,6 +694,12 @@ def _verify_against_truth(
     返回的 dict 直接进 `result.verification`。成功时含摘要与下载路径；
     无实况或失败时含 `available: False` + `reason` —— 前端据此显式说明，
     而不是悄悄少一块。预测本身才是主产物，检验是附加信息。
+
+    ⚠ **调用方契约（C-2/B-3）**：成功分支里的 `truthPath` 是**服务器绝对路径**，
+    而 `result.verification` 会经 `_public_job()` 原样发给前端。调用方**必须**
+    把它 `pop` 出来、改存任务顶层的 `truthFile`（该键不在公开字段白名单里），
+    否则就是把自己的 Dataset 目录结构交给浏览器（B-3）。两个调用点各做一次：
+    `_run_job()` 与 `chain._run_stage3()`。
     """
     lead = context.get("lead")
     year = context.get("year")
@@ -619,12 +720,17 @@ def _verify_against_truth(
         real = np.asarray(np.load(truth, allow_pickle=False), dtype=np.float64)
         r_map = verification.pearson_map(prediction, real)
         summary = verification.summarize(r_map, 0.95)  # 默认 95%，前端可改
-    except (ValueError, OSError) as exc:
-        return {"available": False, "reason": f"实况场对比失败: {exc}"}
+    except (ValueError, OSError, EOFError) as exc:
+        # EOFError 单独列出来：**真 0 字节**的实况件抛的是它（截断件抛 ValueError，
+        # 早就在这张网里）。不接它，一个 0 字节文件就能让整个任务 failed —— 违背
+        # 本函数 docstring 的"尽力而为：检验失败不让整个预测任务失败"。
+        # `_safe_exc` 去掉 `.filename` 里的绝对路径（reason 会进响应）。
+        return {"available": False, "reason": f"实况场对比失败: {_safe_exc(exc)}"}
 
     np.save(_pearson_path(job_dir), r_map.astype(np.float32), allow_pickle=False)
     summary.update({
         "available": True,
+        # 绝对路径：**调用方必须 pop 掉转存顶层 truthFile**，见本函数 docstring。
         "truthPath": str(truth),
         "truthName": truth.name,
         "downloadUrl": f"/api/predict/jobs/{job_id}/download/pearson",
@@ -673,6 +779,10 @@ def _run_job(
         verification_meta = _verify_against_truth(
             prediction, result_path.parent, job_id, context
         )
+        # C-2/B-3：实况文件的绝对路径**只留在进程内**（下面的 `truthFile`）。
+        # `verification_meta` 会经 `result` 进 `_public_job()` 的响应，所以这里
+        # 必须把这一个键摘掉 —— 与 `resultPath` 同一条惯例：内部路径不进响应。
+        truth_file = verification_meta.pop("truthPath", None)
 
         finished = time.time()
         result = {
@@ -692,16 +802,20 @@ def _run_job(
             finishedAt=finished,
             durationSeconds=round(finished - started, 2),
             result=result,
+            truthFile=truth_file,
         )
     except Exception as exc:  # 后台线程必须把错误保存给前端
         finished = time.time()
+        # 总闸：任务执行期抛出的**任意**异常的文本都会进 `error`（前端上屏）。
+        # `_safe_exc` 在这里收口，免得逐点给每个可能抛 `OSError` 的调用包 try。
+        # 覆盖范围只限执行路径；受理路径未纳入（见 `_safe_exc` docstring）。
         _update_job(
             job_id,
             status="failed",
             stage="预测失败",
             finishedAt=finished,
             durationSeconds=round(finished - started, 2),
-            error=f"{type(exc).__name__}: {exc}",
+            error=_safe_exc(exc),
         )
 
 
@@ -880,7 +994,9 @@ def prediction_truth_preview(
     if job.get("status") != "completed":
         raise HTTPException(409, "预测尚未完成")
     meta = (job.get("result") or {}).get("verification") or {}
-    truth_path = meta.get("truthPath")
+    # C-2/B-3：实况路径读**任务顶层** `truthFile`（进程内字段，不在响应里）。
+    # `result.verification.truthPath` 已不再存在 —— 别再退回那里读。
+    truth_path = job.get("truthFile")
     if not truth_path or not Path(truth_path).is_file():
         raise HTTPException(409, meta.get("reason") or "该任务没有可用的实况场")
 

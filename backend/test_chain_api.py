@@ -57,9 +57,10 @@ def is_stale_baseline(name: str) -> bool:
     return any(str(name).startswith(key) for key in STALE_BASELINES)
 
 
-# C-2：服务器绝对路径**绝不该**出现在任何响应里。扫描是**递归**的（真实泄漏
-# 在 `result.verification.truthPath`，第 3 层），标记取自本机实际路径而不是
-# 猜的驱动盘/仓库名 —— 部署环境路径不含仓库名时，硬编码仓库名一个都查不出。
+# C-2/B-3：服务器绝对路径**绝不该**出现在任何响应里。扫描是**递归**的（当初
+# 的真实泄漏在 `result.verification.truthPath`，第 3 层），标记取自本机实际
+# 路径而不是猜的驱动盘/仓库名 —— 部署环境路径不含仓库名时，硬编码仓库名一个
+# 都查不出。
 LEAK_MARKERS = (
     str(HERE.resolve()),           # backend 绝对路径（串里的真泄漏就是这种）
     str(HERE.parent.resolve()),    # 仓库根绝对路径
@@ -68,15 +69,29 @@ LEAK_MARKERS = (
 )
 _DRIVE_RE = re.compile(r"[A-Za-z]:[\\/]")
 
-# **显式 allowlist** —— 用"扫得到但已登记"取代"扫不到就算没有"。B-3 是
-# **继承缺陷**（非本次回归）：`truthPath` 由共享函数 backend/live_prediction.py
-# 写进 result.verification，上游文件在本次 spec 的红线内不得修改，chain.py
-# 只是透传（同一响应里已有 verification.downloadUrl 相对路径）。
-# 修法：另开 issue 一并治理 /api/predict 与 /api/chain 两个路由 —— **不要**
-# 在 chain.py 侧单独擦除，那会让新路由与旧路由口径分叉。
-LEAK_ALLOWLIST = (
-    ("result", "verification", "truthPath"),
-)
+# **allowlist 现在故意留空**：B-3（`truthPath` 泄漏）已按 PM 口径修掉 ——
+# 实况绝对路径改为只存**任务顶层 `truthFile`**，而该键不在任何 `_public_job()`
+# 的字段白名单里（live_prediction.py 与 chain.py 各有一份），结构上不可能进响应；
+# 两个 `truth/preview` 消费者改读它。因此这条递归扫描从此是 B-3 的**真断言**：
+# 只要绝对路径再出现在任一响应里（新路由或旧路由），本套件立刻判红。
+#
+# 保留这个空元组而不是删掉机制，是为了让"重新豁免"必须是一次**显式登记**。
+# 配套的自检在下面 `check(not LEAK_ALLOWLIST, ...)`：谁把它填回去，谁就先红。
+LEAK_ALLOWLIST = ()
+
+
+# B-3 修复的"其余一切不变"侧：`result.verification` 的**键集**。改前含
+# `truthPath`（18 键），改后只少这一个（17 键）。用集合等值断言而不是"逐项检查
+# 字段还在" —— 后者挡不住"顺手多塞一个键"这种口径漂移，也挡不住少一个。
+# 14 个统计键来自 `verification.summarize()`，3 个附加键来自
+# `_verify_against_truth()`（其中 downloadUrl 由各 router 覆写成自己的前缀）。
+VERIFICATION_KEYS = {
+    "n", "confidence", "criticalR", "meanR", "medianR", "minR", "maxR",
+    "positiveFraction", "significantPositiveFraction",
+    "significantNegativeFraction", "significantFraction", "definedPoints",
+    "undefinedPoints", "totalPoints",
+    "available", "truthName", "downloadUrl",
+}
 
 
 def _is_allowlisted(path: tuple) -> bool:
@@ -87,8 +102,8 @@ def _leak_hits(node, path=()):
     """递归找出响应体里带服务器绝对路径的字段，返回 (JSON 路径, 值) 列表。
 
     容器（dict/list）继续下钻，字符串对 LEAK_MARKERS 逐个 find。
-    命中 LEAK_ALLOWLIST 的字段**仍会打印**出来（登记在案的继承缺陷，见 B-3），
-    但不算作未授权泄漏 —— 这正是"不假装它不存在"。
+    命中 LEAK_ALLOWLIST 的字段**仍会打印**出来，但不算作未授权泄漏 —— 这正是
+    "不假装它不存在"。B-3 修复后该 allowlist 为空，所以打印分支不该再触发。
     """
     hits = []
     if isinstance(node, dict):
@@ -111,7 +126,7 @@ def check_no_leak(doc, label):
     allowed = [h for h in hits if _is_allowlisted(tuple(h[0].split(".")))]
     unallowed = [h for h in hits if h not in allowed]
     for where, value in allowed:
-        print("      [i] 已知继承缺陷（登记在 LEAK_ALLOWLIST，见 B-3）："
+        print("      [i] 登记在 LEAK_ALLOWLIST 的豁免命中（B-3 已修，不该再有）："
               "%s = %s" % (where, value))
     return check(not unallowed, label,
                  ["%s = %s" % (w, v) for w, v in unallowed][:3])
@@ -205,10 +220,20 @@ os.environ["CHAIN_JOB_ROOT"] = str(JOB_ROOT)
 os.environ["PREDICTION_JOB_ROOT"] = str(LEGACY_JOB_ROOT)
 
 import chain as ch                                   # noqa: E402
+import cio_diagnostics as cd                         # noqa: E402  （第5轮：/api/cio 终态扫描）
 import live_prediction as lp                         # noqa: E402
+import verification                                  # noqa: E402  （D3 打桩 find_truth）
 
 ch.JOB_ROOT = JOB_ROOT                               # 与 env 同值，双保险
 lp.JOB_ROOT = LEGACY_JOB_ROOT
+# 第 5 轮：`cio_diagnostics.JOB_ROOT` 是**硬编码**的
+# `prediction.BACKEND_DIR / "uploads" / "cio_jobs"`，**不读 env**（cd:29）——
+# 不改它在运行期兜底，`/api/cio/jobs` 会直接往真工作区里写任务目录。
+# 这里猴补丁是安全的：`cd` 只在函数体内用 `JOB_ROOT`（cd:538），没有 import 期
+# 派生值，而且补丁在任何请求之前就位。下面 REAL_JOB_DIRS 守卫一并收紧。
+CD_JOB_ROOT = TMP_BASE / "cio_jobs"
+CD_JOB_ROOT.mkdir(parents=True, exist_ok=True)
+cd.JOB_ROOT = CD_JOB_ROOT
 
 
 def _inside(path, base):
@@ -222,8 +247,9 @@ def _inside(path, base):
 
 # 真工作区的两个任务库：本轮自检**一个字节都不许往里写**（C-4）。
 REAL_JOB_DIRS = (HERE / "uploads" / "chain_jobs",
-                 HERE / "uploads" / "prediction_jobs")
-LEAKED_ROOTS = [d for d in (ch.JOB_ROOT, lp.JOB_ROOT)
+                 HERE / "uploads" / "prediction_jobs",
+                 HERE / "uploads" / "cio_jobs")     # 第5轮：/api/cio 也要证明没写
+LEAKED_ROOTS = [d for d in (ch.JOB_ROOT, lp.JOB_ROOT, cd.JOB_ROOT)
                 if any(_inside(d, real) for real in REAL_JOB_DIRS)]
 if LEAKED_ROOTS:
     print("⚠  任务目录没隔离到临时区，自检会往真工作区里写文件：")
@@ -248,6 +274,11 @@ client = TestClient(app)
 legacy = FastAPI()
 legacy.include_router(lp.router)
 legacy_client = TestClient(legacy)
+# 第 5 轮新增：CIO 链路检查路由（此前本套件**从未调用过**，所以它的终态
+# `projection` 同样带着 `matPath` 却没人扫 —— 见下面 A6 段的说明）。
+cio_app = FastAPI()
+cio_app.include_router(cd.router)
+cio_client = TestClient(cio_app)
 CHAIN_PREFIX = "/api/chain/jobs"
 
 real_inference = lp._run_archive_inference
@@ -344,7 +375,12 @@ INFERENCE_HI = ch.INFERENCE_SPAN[1]   # 上界（=97）：二次映射会让终�
 
 
 def wait(job_id, timeout=300, prefix=CHAIN_PREFIX):
-    http = legacy_client if prefix.startswith("/api/predict") else client
+    if prefix.startswith("/api/predict"):
+        http = legacy_client
+    elif prefix.startswith("/api/cio"):
+        http = cio_client
+    else:
+        http = client
     end = time.time() + timeout
     while time.time() < end:
         data = http.get("%s/%s" % (prefix, job_id)).json()
@@ -390,6 +426,12 @@ E2E = bool(os.environ.get("CHAIN_E2E"))
 B_STUB = not E2E
 lp._run_archive_inference = fake_inference if B_STUB else real_inference
 try:
+    # B-3 自检：豁免表必须为空。这条断言的作用不是"扫得多严"，而是让**重新豁免**
+    # 这件事必须先把这条断言改红 —— 否则后人给新泄漏加一条 allowlist 就能静默糊过去。
+    check(not LEAK_ALLOWLIST,
+          "泄漏扫描没有登记任何豁免（B-3 已修，豁免表保持空）",
+          LEAK_ALLOWLIST)
+
     # =============================================== A. 受理与 API 契约
     print("A. 受理与 API 契约（打桩推理）")
 
@@ -614,6 +656,43 @@ try:
                       timeout=3600 if E2E else 300)
     check(legacy_job.get("status") == "completed", "旧路由任务跑完",
           "%s %s" % (legacy_job.get("status"), legacy_job.get("error")))
+
+    # =========================================== A6. 终态响应无绝对路径（A/B 组判别用例）
+    # 第 5 轮返工。**为什么必须扫终态、而不是扫 202**：
+    #   202 的 `projection` 是受理期瘦身版（`.zip` 入口只回 matSource 一族），
+    #   `matPath` / `sandboxRoot` 是 `_run_job` 把 `prepare()` 返回的**完整**
+    #   projection 写回 job 之后才出现的（live_prediction.py:717-723），而
+    #   `_public_job` 把 `projection` 当**整体放行的容器键**（lp:97 / cd:80）。
+    #   → 泄漏**只**在终态响应上。扫 202 会写出一条永远绿的假断言。
+    # **为什么以前一直漏掉**（不是"扫得不够深"，是"扫的对象不对"）：
+    #   本套件此前扫过的旧路由任务都是 **.npy** 入口（`projection` 只有
+    #   `{"inputKind": "cio-npy"}`，结构上就没有 matPath）；而 `/api/cio/jobs`
+    #   在本套件里**从未被调用过**。这个 `.zip` 旧路由任务一直没进扫描名单。
+    def _terminal_no_abs_path(job, label, want_mat_name):
+        """终态响应：既不能漏绝对路径，也不能把资产身份行改没了。"""
+        check_no_leak(job, "%s：终态响应递归扫不到任何绝对路径" % label)
+        proj = job.get("projection") or {}
+        check(proj.get("matSource") == ("real" if IS_REAL else "mock")
+              and proj.get("matPath") == want_mat_name,
+              "%s：资产身份行照常显示（matSource + 纯文件名）" % label,
+              {k: proj.get(k) for k in ("matSource", "matPath")})
+        check("sandboxRoot" not in proj,
+              "%s：sandboxRoot 键已删（全仓零消费方，无需保留）" % label,
+              sorted(proj))
+
+    _terminal_no_abs_path(legacy_job, "旧路由 /api/predict/jobs（.zip 入口）", MAT.name)
+
+    r = cio_client.post("/api/cio/jobs?lead=1&which=u850",
+                        files={"file": ("cesm.uwnd.5-9.zip", ZIP_BYTES,
+                                        "application/zip")})
+    check(r.status_code == 202, "/api/cio/jobs 建任务 -> 202", r.text[:200])
+    cio_job = wait(r.json()["jobId"], prefix="/api/cio/jobs")
+    check(cio_job.get("status") == "completed", "/api/cio 任务跑完",
+          "%s %s" % (cio_job.get("status"), cio_job.get("error")))
+    _terminal_no_abs_path(cio_job, "/api/cio/jobs（.zip 入口）", MAT.name)
+    if cio_job.get("status") == "completed":
+        shutil.rmtree(cd.JOB_ROOT / cio_job["jobId"], ignore_errors=True)
+
     legacy_cio = CAPTURED.get("cio")
     legacy_job_dir = lp.JOB_ROOT / legacy_job["jobId"]
     legacy_pred = np.load(legacy_job_dir / "prediction.npy", allow_pickle=False)
@@ -839,7 +918,7 @@ try:
               "/series projectionMode=u850_only", r.status_code)
         # C-2：任务状态端点也不外泄服务器绝对路径。
         # 这里是 `jid`（C 段计数任务）的状态响应：它跑在实况件创建**之前**，
-        # `verification.available=False`，**这份响应里根本没有 truthPath** ——
+        # `verification.available=False`，**这份响应里没有实况路径可泄漏** ——
         # 所以它证明不了"有实况时也不泄漏"，那件事由 D 段带实况件的那份响应
         # （下面的 check_no_leak ③）负责（B-2 的第二重失效就在于此）。
         status_doc = client.get("%s/%s" % (CHAIN_PREFIX, jid)).json()
@@ -922,14 +1001,32 @@ try:
               and ver.get("downloadUrl")
               == "/api/chain/jobs/%s/download/pearson" % job["jobId"],
               "有实况 -> verification.downloadUrl 指向链路前缀", ver)
-        # C-2/B-2：**这份**才是带实况件的响应（verification.available=True），
-        # truthPath 就在 `result.verification` 第 3 层 —— 上面扫 jid 那份时它
-        # 根本不存在。递归扫描 + 显式 allowlist：命中的 truthPath 是 B-3 的
-        # **继承缺陷**（源头在红线内的 live_prediction.py），登记而不隐藏，
-        # 其余任何绝对路径仍然判失败。
+        # C-2/B-3：**这份**才是带实况件的响应（verification.available=True）。
+        # B-3 修好后这里**一个字面量都不豁免**。修法是"改存私有键"而不是
+        # "出口处擦除"：实况绝对路径只存**任务顶层 `truthFile`**，该键不在
+        # `_public_job()` 白名单里 → 结构上进不了响应。所以下面三条要一起成立：
+        #   ① 响应里扫不到任何绝对路径（真断言，不再是 allowlist 安慰剂）；
+        #   ② 进程内确实有 truthFile 且指向真文件 —— 证明①不是靠"把实况路径
+        #      整个丢掉/换成 None"换来的（那会让两个 truth/preview 一起 409）；
+        #   ③ 对外可见的 truthName/downloadUrl 原样保留，键集与改前逐键一致。
+        # 缺②，一条"删掉整块 verification"的实现也能让①变绿。
         check_no_leak(job,
-                      "有实况件的 GET /jobs/{id} 里没有**未登记**的服务器绝对路径"
-                      "（truthPath 属已知继承缺陷，见 B-3）")
+                      "有实况件的 GET /api/chain/jobs/{id} 里没有任何服务器绝对路径"
+                      "（递归扫描，无豁免）")
+        inner = ch._get_job(job["jobId"])
+        check(isinstance(inner.get("truthFile"), str)
+              and Path(inner["truthFile"]).is_file(),
+              "链路：实况绝对路径改存进程内顶层 truthFile（消费者仍读得到）",
+              inner.get("truthFile"))
+        check("truthFile" not in job and "jobDir" not in job
+              and "resultPath" not in job,
+              "链路：truthFile/jobDir/resultPath 都不在公开响应里（白名单默认不公开）",
+              sorted(job))
+        check(set(ver) == VERIFICATION_KEYS,
+              "链路 verification 键集与改前逐键一致（只少了 truthPath）",
+              sorted(set(ver) ^ VERIFICATION_KEYS))
+        check(ver.get("truthName") == truth_file and ver.get("downloadUrl"),
+              "链路 verification.truthName/downloadUrl 原样保留（前端零改动）", ver)
         r = client.get("%s/%s/pearson?confidence=0.95" % (CHAIN_PREFIX, job["jobId"]))
         pe = r.json()
         check(r.status_code == 200 and pe["rows"] == 81 and pe["cols"] == 101
@@ -937,10 +1034,159 @@ try:
               "/pearson 可用且 data 可 JSON 解析", r.status_code)
         r = client.get("%s/%s/truth/preview?time_index=0" % (CHAIN_PREFIX, job["jobId"]))
         check(r.status_code == 200 and r.json()["rows"] == 81,
-              "/truth/preview 可用", r.status_code)
+              "链路 /truth/preview 仍然 200（B-3 最容易改崩的点）",
+              "%s %s" % (r.status_code, r.text[:120]))
         r = client.get("%s/%s/download/pearson" % (CHAIN_PREFIX, job["jobId"]))
         check(r.status_code == 200, "download/pearson 可下载", r.status_code)
+
+        # --- 旧路由同口径：B-3 的源头在共享函数 `_verify_against_truth`，两个
+        # 路由都会被它波及，所以两侧必须一起验。旧路由这一份是**改动的另一半**
+        # 证据：只修链路会让两条路由口径分叉（B-3 明令禁止的那种修法）。
+        r = legacy_client.post("/api/predict/jobs?year=2000&lead=pre1&which=cio",
+                               files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+        check(r.status_code == 202, "旧路由建实况对照任务 -> 202", r.text[:160])
+        legacy_truth_job = wait(r.json()["jobId"], prefix="/api/predict/jobs")
+        lver = (legacy_truth_job.get("result") or {}).get("verification") or {}
+        check(lver.get("available") is True and lver.get("truthName") == truth_file,
+              "旧路由有实况 -> available/truthName 原样保留", lver)
+        check(set(lver) == VERIFICATION_KEYS,
+              "旧路由 verification 键集与改前逐键一致（只少了 truthPath）",
+              sorted(set(lver) ^ VERIFICATION_KEYS))
+        check_no_leak(legacy_truth_job,
+                      "旧路由 GET /api/predict/jobs/{id} 同样扫不到任何绝对路径"
+                      "（递归扫描，无豁免）")
+        legacy_inner = lp._get_job(legacy_truth_job["jobId"])
+        check(isinstance(legacy_inner.get("truthFile"), str)
+              and Path(legacy_inner["truthFile"]).is_file(),
+              "旧路由：实况绝对路径也改存进程内顶层 truthFile",
+              legacy_inner.get("truthFile"))
+        r = legacy_client.get("/api/predict/jobs/%s/truth/preview?time_index=0"
+                              % legacy_truth_job["jobId"])
+        check(r.status_code == 200 and r.json()["rows"] == 81,
+              "旧路由 /truth/preview 仍然 200（改崩这里就是 409）",
+              "%s %s" % (r.status_code, r.text[:120]))
+        shutil.rmtree(lp.JOB_ROOT / legacy_truth_job["jobId"], ignore_errors=True)
         (day / truth_file).unlink(missing_ok=True)
+
+        # ============================================ D3. 异常文本的出口净化
+        # 追加要求（PM 批准）：`reason` / `error` 会把**异常文本**直接送进响应
+        # （`error` 还会被前端上屏，见 R3-4）。`OSError.filename` 是服务器绝对
+        # 路径，所以执行路径上的两处**总闸**与实况检验的 reason 都要过
+        # `_safe_exc()`。
+        #
+        # ⚠ 这段一律打桩，**不指向 Dataset/ 下任何真实文件**：三个用例都是
+        # "实况读失败/读坏"，拿真件去触发等于靠改真件——而且真件被改了别处会红。
+        print("D3. 异常文本出口净化（打桩，不碰真实况）")
+        real_find_truth = verification.find_truth
+        real_archive_infer = lp._run_archive_inference
+        no_path_markers = ("C:", "D:", ":\\", "\\\\")   # 硬字符串，不用正则
+
+        def _verification_case(label, truth_path, want_shape_text=None):
+            """把 find_truth 钉到指定件上跑一条链，返回 (job, reason)。"""
+            verification.find_truth = lambda lead, year: truth_path
+            try:
+                r = client.post("/api/chain/jobs?year=2000&lead=pre1&which=cio",
+                                files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+                check(r.status_code == 202, "%s：受理 -> 202" % label,
+                      "%s %s" % (r.status_code, r.text[:160]))
+                job = wait(r.json()["jobId"])
+            finally:
+                verification.find_truth = real_find_truth
+            ver = (job.get("result") or {}).get("verification") or {}
+            reason = ver.get("reason") or ""
+            check(job.get("status") == "completed" and ver.get("available") is False,
+                  "%s：检验失败**不拖垮任务**（completed + available=False）" % label,
+                  (job.get("status"), ver, job.get("error")))
+            check(not any(m in reason for m in no_path_markers),
+                  "%s：reason 里没有绝对路径标记（硬字符串检测）" % label, reason)
+            check_no_leak(job, "%s：整份响应里没有绝对路径（递归扫描）" % label)
+            if want_shape_text:
+                check(want_shape_text in reason,
+                      "%s：诊断信息没被误删（reason 含 %s）"
+                      % (label, want_shape_text), reason)
+            return job, reason
+
+        # 这段只验**文本**，不验数值：强制打桩，免得真推理把 E 段拖长几分钟。
+        lp._run_archive_inference = fake_inference
+        try:
+            # ① OSError 分支：真实存在的 OSError 才会带 `.filename`（绝对路径）
+            missing = TMP_BASE / "no_such_dir" / "pre_1_2000_missing_real2.npy"
+            _job, reason = _verification_case("实况文件不存在", missing)
+            check(missing.name in reason and "FileNotFoundError" in reason,
+                  "实况文件不存在：reason 保留了**文件名**（可诊断）", reason)
+
+            # ② 真 0 字节实况件 -> EOFError。**必须是真 0 字节**：截断件
+            #    （\x93NUMPY... 或缺 magic）抛的是 ValueError，早就被接住了，
+            #    拿截断件测这一条会假绿（实测确认）。
+            zero = TMP_BASE / "zero_real2.npy"
+            zero.write_bytes(b"")
+            _job, reason = _verification_case("0 字节实况件", zero)
+            check("EOFError" in reason, "0 字节实况件：reason 点出 EOFError", reason)
+
+            # ③ 形状不一致：ValueError，`str(exc)` 必须**原样保留** ——
+            #    "(81, 101, 112) 与 (5, 5, 5) 不一致" 是最常用的诊断信息，
+            #    无条件套 `[Errno None] None` 会把它毁掉。
+            odd = TMP_BASE / "odd_real2.npy"
+            np.save(odd, np.zeros((5, 5, 5), dtype=np.float64))
+            _job, reason = _verification_case("实况件形状不一致", odd, "(5, 5, 5)")
+            check("不一致" in reason, "形状不一致：ValueError 原文保留", reason)
+
+            # ④ 两处**总闸**：任务执行期抛出的任意异常也走 `_safe_exc`。
+            #    路径取 TMP_BASE 下的不存在文件，basename 唯一。
+            boom_path = TMP_BASE / "missing_model_archive.tar.gz"
+
+            def boom(*_a, **_kw):
+                raise FileNotFoundError(2, "No such file or directory", str(boom_path))
+
+            lp._run_archive_inference = boom
+            for label, http, prefix in (
+                    ("链路总闸", client, CHAIN_PREFIX),
+                    ("旧路由总闸", legacy_client, "/api/predict/jobs")):
+                r = http.post("%s?year=2000&lead=pre1&which=cio" % prefix,
+                              files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+                job = wait(r.json()["jobId"], prefix=prefix)
+                err = job.get("error") or ""
+                check(job.get("status") == "failed", "%s：任务确实 failed" % label,
+                      job.get("status"))
+                check(boom_path.name in err, "%s：error 里保留了文件名" % label, err)
+                check(not any(m in err for m in no_path_markers),
+                      "%s：error 里没有绝对路径标记（硬字符串检测）" % label, err)
+                check_no_leak(job, "%s：整份响应里没有绝对路径（递归扫描）" % label)
+
+            # ⑤ **我们自己 `raise` 的异常**：单参 `FileNotFoundError(f"...{PATH}")`
+            #    的 `.filename` 是 None，会绕过总闸的 `.filename` 分支走 else，
+            #    把模型包的绝对路径原样吐进 `error`（该串前端上屏，R3-4）。
+            #    这里让**真的** `_run_archive_inference` 跑：把 `MODEL_ARCHIVE`
+            #    指到临时区的不存在文件，它在 `is_file()` 处立刻抛，不会真开包。
+            #    ⚠ 打桩只碰临时区，不指向真实模型包。
+            #    ⚠ 这里必须用 `real_inference`（:269 在**任何打桩之前**抓的原函数），
+            #    不能用 D3 开头的 `real_archive_infer` —— 那个抓到的是当时的
+            #    `fake_inference`，拿它"跑真函数"会让本条恒真（实测踩过）。
+            bogus_archive = TMP_BASE / "no_such_model_archive.tar.gz"
+            lp._run_archive_inference = real_inference
+            real_model_archive = lp.MODEL_ARCHIVE
+            lp.MODEL_ARCHIVE = bogus_archive
+            try:
+                for label, http, prefix in (
+                        ("模型包缺失·链路", client, CHAIN_PREFIX),
+                        ("模型包缺失·旧路由", legacy_client, "/api/predict/jobs")):
+                    r = http.post("%s?year=2000&lead=pre1&which=cio" % prefix,
+                                  files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+                    job = wait(r.json()["jobId"], prefix=prefix)
+                    err = job.get("error") or ""
+                    check(job.get("status") == "failed",
+                          "%s：任务 failed" % label, job.get("status"))
+                    check(bogus_archive.name in err,
+                          "%s：error 保留了模型包**文件名**（还能诊断）" % label, err)
+                    check(not any(m in err for m in no_path_markers),
+                          "%s：error 里没有绝对路径标记（硬字符串检测）"
+                          % label, err)
+                    check_no_leak(job, "%s：整份响应里没有绝对路径" % label)
+            finally:
+                lp.MODEL_ARCHIVE = real_model_archive
+                lp._run_archive_inference = fake_inference
+        finally:
+            lp._run_archive_inference = real_archive_infer
     finally:
         lp._prepare_cio = real_prepare
         lp._run_archive_inference = fake_inference
