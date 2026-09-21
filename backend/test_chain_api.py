@@ -346,8 +346,12 @@ REAL_SNAPSHOT_AFTER = None      # finally 里赋值；异常提前退出时下�
 write_checks_done = False       # 零写入比对是否真的跑过（不许静默跳过）
 
 
-def fake_inference(cio, progress_callback=None, span=(3, 95)):
-    """桩：记下真正喂进模型的张量，回一个由它铺出来的场。"""
+def fake_inference(cio, progress_callback=None, span=(3, 95), **kw):
+    """桩：记下真正喂进模型的张量，回一个由它铺出来的场。
+
+    `**kw` 吸收 `_run_archive_inference` 新增的 keyword-only `lead`/`year`
+    （import-all-models §6.1：只同步签名，**不改任何断言口径**）。
+    """
     CAPTURED["cio"] = np.array(cio, copy=True)
     if progress_callback:
         progress_callback(span[0], "桩推理开始")
@@ -618,24 +622,346 @@ try:
     check(default_params_job["status"] == "completed",
           "默认参数的链路任务跑完", default_params_job.get("error"))
 
-    for params, label in (
-            ({"year": 2001, "lead": "pre1"}, "year=2001"),
-            ({"year": 2000, "lead": "pre2"}, "lead=pre2"),
+    for params, want, label in (
+            ({"year": 2001, "lead": "pre1"}, "pre1/2001", "year=2001"),
+            ({"year": 2000, "lead": "pre2"}, "pre2/2000", "lead=pre2"),
             ({"year": 2001, "lead": "pre1", "onlyProjection": "true"},
-             "year=2001 + onlyProjection（不放宽）"),
+             "pre1/2001", "year=2001 + onlyProjection（不放宽）"),
             ({"year": 2000, "lead": "pre2", "onlyProjection": "true"},
-             "lead=pre2 + onlyProjection（不放宽）")):
+             "pre2/2000", "lead=pre2 + onlyProjection（不放宽）")):
         r = client.post("/api/chain/jobs", params=params,
                         files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
-        check(r.status_code == 400
-              and "当前模型验证仅支持 year=2000、lead=pre1" in r.text,
-              "400：%s" % label, "%s %s" % (r.status_code, r.text[:160]))
+        # 口径改了（import-all-models §4.1/§4.2）：不再是"唯一规则表"那句，
+        # 而是查可用性 —— 文案含组合标识与原因，且与"格式非法"分开。
+        check(r.status_code == 400 and want in r.text
+              and "格式" not in r.text,
+              "400：%s（组合不可用文案）" % label,
+              "%s %s" % (r.status_code, r.text[:160]))
 
     # 被拒的任务不留目录：A1 zip 全链 + A2 npy 全链 + A3 只跑投影 + 缺月 zip
     # + 无参数 = 5
     leftovers = sorted(p.name for p in JOB_ROOT.iterdir())
     check(len(leftovers) == 5, "五次成功受理 = 5 个目录，被拒的都不留店",
           leftovers)
+
+    # ================== A7. 权重组清单与放开受理（import-all-models，AC1/AC3/AC4）
+    #
+    # 判据来源：`.harness/spec/changes/import-all-models/` 的 tasks.md §1/§2/§3/§4。
+    # **组数是动态的**（权重仍在下载）：下面一律实测，不写死任何组数。
+    print("A7. 权重组清单与放开受理（import-all-models）")
+    _a7_path_markers = ("C:", "D:", ":\\", "\\\\")
+
+    # --- A7.1 清单端点：形状 / 不变量 / 无路径
+    r = client.get("/api/chain/models")
+    check(r.status_code == 200, "GET /api/chain/models -> 200", r.text[:200])
+    catalog = r.json()
+    check_no_leak(catalog, "清单响应里没有任何磁盘路径（递归扫描）")
+    _leads = {item["lead"]: item for item in catalog.get("leads", [])}
+    check(sorted(_leads) == ["pre1", "pre10", "pre15", "pre3", "pre5"],
+          "清单覆盖 4 个 lead + 冻结归档 pre1", sorted(_leads))
+    _GRID_YEARS = [2000, 2002, 2003, 2005, 2007, 2008, 2009, 2010, 2012]
+    for _lead in ("pre3", "pre5", "pre10", "pre15"):
+        check([y["year"] for y in _leads[_lead]["years"]] == _GRID_YEARS,
+              "%s 列出 9 个候选年" % _lead,
+              [y["year"] for y in _leads[_lead]["years"]])
+    _p1 = _leads["pre1"]["years"]
+    check([y["year"] for y in _p1] == [2000] and _p1[0]["source"] == "archive",
+          "pre1 只有冻结归档 2000（source=archive）", _p1)
+
+    _mismatch, _missing_reason, _n_avail = [], [], 0
+    for _item in catalog["leads"]:
+        for _y in _item["years"]:
+            _live = lp.resolve_model_group(_item["lead"], _y["year"])
+            if bool(_live["available"]) != bool(_y["available"]):
+                _mismatch.append((_item["lead"], _y["year"],
+                                  _y["available"], _live["available"]))
+            if _y["available"]:
+                _n_avail += 1
+            elif not _y.get("reason"):
+                _missing_reason.append((_item["lead"], _y["year"]))
+    check(not _mismatch,
+          "清单 available ⇔ resolve_model_group 逐组相等（唯一谓词）", _mismatch)
+    check(not _missing_reason,
+          "不可用项一律带 reason（前端禁选项的提示文案）", _missing_reason)
+    check(_n_avail > 0, "至少有一组可用（数量动态，不写死）", _n_avail)
+    _avail_pair = next(
+        ((i["lead"], y["year"])
+         for i in catalog["leads"] for y in i["years"] if y["available"]), None)
+    # 原写法 `_avail_pair != ("pre1", 2000) or True` 恒真（不论取到什么都是 True），
+    # 是"断言群恒真"那类无牙检查，改为对生成器耗尽这一真实失败模式取值。
+    check(_avail_pair is not None,
+          "取到一组可用组合（数量动态，不写死）", _avail_pair)
+
+    # --- A7.2 组合不可用 => 400（文案含组合标识 + 原因，且不含路径）
+    _UNAVAIL = ("pre3", 2011)                # 该年不在候选网格里，恒不可用
+    r = client.post("/api/chain/jobs?year=%d&lead=%s&which=cio" % (_UNAVAIL[1], _UNAVAIL[0]),
+                    files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+    check(r.status_code == 400
+          and ("%s/%d" % _UNAVAIL) in r.text
+          and not any(m in r.text for m in _a7_path_markers),
+          "400：不可用组合带组合标识与原因（无绝对路径）",
+          "%s %s" % (r.status_code, r.text[:200]))
+    # 4.2：格式非法与"组合不可用"必须是两句不同的话
+    r = client.post("/api/chain/jobs?year=2000&lead=prex&which=cio",
+                    files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+    check(r.status_code == 400 and "格式" in r.text,
+          "400：lead 格式非法走另一句文案", "%s %s" % (r.status_code, r.text[:160]))
+    r = client.post("/api/chain/jobs?year=2000&lead=pre2&which=cio",
+                    files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+    check(r.status_code == 400 and "pre2/2000" in r.text and "格式" not in r.text,
+          "400：lead 合法但组合不可用 -> 组合文案（不是格式文案）",
+          "%s %s" % (r.status_code, r.text[:160]))
+
+    # --- A7.3 可用组合：受理通过 + 落盘 + 下载文件名跟随实际 (lead, year)
+    #
+    # ⚠ 这一单同时是 **AC4「技巧检验对每组都取到 Dataset/{lead}/{year} 真值」**
+    # 的锚点（C012），所以发单前先把 `TRUTH_DIR` **临时摘掉**：
+    # 套件全局把它指向临时夹具根（:218），而夹具只有 pre1/2000 一份（:1283）——
+    # 照原样发这条 job，它**永远查不到实况**（available=False），AC4 在套件里
+    # 结构上无从钉起。摘掉后回落到 `verification._truth_roots()` 的真实搜索根，
+    # 这一单才真的跟 `Dataset/pre3/2012/` 的真件对拍（跑完立刻在 finally 里还回去）。
+    _truth_expect = verification.PROJECT_ROOT / "Dataset" / "pre3" / "2012"
+    _truth_on_disk = (sorted(p.name for p in _truth_expect.glob("*_real2.npy"))
+                      if _truth_expect.is_dir() else [])
+    check(bool(_truth_on_disk),
+          "A7.3 前提：Dataset/pre3/2012/ 下有实况件（AC4 的对照盘面就位）",
+          _truth_expect)
+    _saved_truth_dir = os.environ.pop("TRUTH_DIR", None)
+    try:
+        r = client.post("/api/chain/jobs?year=2012&lead=pre3&which=cio",
+                        files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+        check(r.status_code == 202, "A7：可用组合 (pre3,2012) 受理 -> 202", r.text[:160])
+        a7_job = wait(r.json()["jobId"])
+    finally:
+        if _saved_truth_dir is not None:
+            os.environ["TRUTH_DIR"] = _saved_truth_dir
+    check(a7_job.get("status") == "completed", "A7：(pre3,2012) 链路跑完",
+          a7_job.get("error"))
+
+    # AC4（C012）：技巧检验取到的那份真值必须**归属本任务请求的那一组**，
+    # 不是写死/串到别的组（pre1/2000 是最危险的那个"默认值"——pre1/2000 的
+    # 既有用例 :1289 逐字不动，它对本条要抓的错**结构上无区分力**：请求的恰好
+    # 就是 pre1/2000）。判据全部是**结构性**的：目录归属 + 盘上文件名集合；
+    # `truthFile` 取自进程内任务态（绝对路径不出公开响应，那里只有 basename）。
+    _ver7 = (a7_job.get("result") or {}).get("verification") or {}
+    _truth_file = str(ch._get_job(a7_job["jobId"]).get("truthFile") or "")
+    _truth_dir7 = Path(_truth_file).resolve().parent if _truth_file else None
+    print("      [i] A7.3b (pre3,2012) 实况来源 = %s" % (_truth_file or "<无>"))
+    check(_ver7.get("available") is True,
+          "A7.3b：(pre3,2012) 真取到了实况并算了 r（不是静默跳过/静默降级）",
+          _ver7)
+    check(_truth_dir7 == _truth_expect.resolve(),
+          "A7.3b：实况件归属 Dataset/pre3/2012/（串到别组即红：不是 pre1/2000）",
+          _truth_file)
+    check(_ver7.get("truthName") == Path(_truth_file).name
+          and _ver7.get("truthName") in _truth_on_disk,
+          "A7.3b：truthName 是 Dataset/pre3/2012/ 盘上真在的那一个",
+          (_ver7.get("truthName"), _truth_on_disk[:2]))
+    # 内容级：上屏的实况序列必须逐点等于**该组盘上真件**本身。对照物取自
+    # `Dataset/pre3/2012/`（**不是** job 自己报的那个 `truthFile`），所以这条
+    # 同样是跨组判据：串到别组就会拿另一组的场来比，逐点对不上。
+    _grid7, _expect7 = {}, None
+    _r7g = client.get("%s/%s/grid?i=40&j=50" % (CHAIN_PREFIX, a7_job["jobId"]))
+    _disk7 = (_truth_expect / _truth_on_disk[0]) if _truth_on_disk else None
+    if _r7g.status_code == 200 and _disk7 is not None and _disk7.is_file():
+        _grid7 = _r7g.json()
+        _real7 = np.load(_disk7, mmap_mode="r", allow_pickle=False)
+        _expect7 = [None if not np.isfinite(v) else float(v)
+                    for v in np.asarray(_real7[40, 50, :], dtype=np.float64)]
+    check(_expect7 is not None and _grid7.get("truth") == _expect7
+          and _grid7.get("truthName") == _ver7.get("truthName"),
+          "A7.3b：/grid 上屏的实况逐点等于 Dataset/pre3/2012/ 盘上真件"
+          "（对照物独立于 job 自报的 truthFile）",
+          (_r7g.status_code, _grid7.get("truthName"), _truth_file))
+
+    _p = a7_job.get("projection") or {}
+    check(_p.get("lead") == 3 and _p.get("year") == 2012,
+          "A7：projection 落库实际 (lead, year)", (_p.get("lead"), _p.get("year")))
+    _norm = a7_job.get("normalization") or {}
+    # 21 年（2000–2020）各 112 天 ⇒ 2012 的窗口起点 = 12 × 112
+    check(_norm.get("windowStart") == 12 * 112 and _norm.get("targetYear") == 2012,
+          "A7：窗口按目标年定位（windowStart=1344 / targetYear=2012）",
+          {k: _norm.get(k) for k in ("windowStart", "targetYear", "selectedRange")})
+    check(_norm.get("mode") == "training-equivalent" and not _norm.get("warning"),
+          "A7：目标年仍落训练基准内 -> mode 不变、无 warning",
+          (_norm.get("mode"), _norm.get("warning")))
+    for _tail, _want in (("prediction", "prediction_pre3_2012.npy"),
+                         ("normalized", "normalized_window_pre3_2012.npy"),
+                         ("cio", "projected_cio_pre3_2012.npy")):
+        _r7 = client.get("%s/%s/download/%s" % (CHAIN_PREFIX, a7_job["jobId"], _tail))
+        _cd = _r7.headers.get("content-disposition", "")
+        check(_r7.status_code == 200 and _want in _cd,
+              "A7：download/%s 文件名跟随实际组合" % _tail,
+              "%s %s" % (_r7.status_code, _cd))
+    # 4.5：pre1/2000 上逐字不变
+    _r7 = client.get("%s/%s/download/prediction"
+                     % (CHAIN_PREFIX, default_params_job["jobId"]))
+    check("prediction_pre1_2000.npy" in _r7.headers.get("content-disposition", ""),
+          "A7：pre1/2000 下载文件名逐字不变",
+          _r7.headers.get("content-disposition"))
+
+    # --- A7.4 接线（P0）：推理函数必须收到**请求的** (lead, year)，不是默认值
+    _seen_infer = {}
+
+    def _capturing_inference(cio, progress_callback=None, span=(3, 95), **kw):
+        _seen_infer.update(kw)
+        return fake_inference(cio, progress_callback, span)
+
+    lp._run_archive_inference = _capturing_inference
+    try:
+        r = client.post("/api/chain/jobs?year=2012&lead=pre3&which=cio",
+                        files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+        _cap_job = wait(r.json()["jobId"])
+    finally:
+        lp._run_archive_inference = fake_inference
+    check(_cap_job.get("status") == "completed", "A7：接线用例跑完",
+          _cap_job.get("error"))
+    check(_seen_infer.get("lead") == "pre3" and _seen_infer.get("year") == 2012,
+          "A7：推理入口收到 (lead=pre3, year=2012) —— 漏传即静默回退 pre1/2000",
+          _seen_infer)
+
+    # --- A7.5 .npy 入口：均匀年表 + 越界年被拒（受理期，不留到后台）
+    for _bad_year in (1990, 2021):
+        _d7 = TMP_BASE / ("a7_npy_%d" % _bad_year)
+        _d7.mkdir(parents=True, exist_ok=True)
+        try:
+            ch._intake_npy(npy_bytes(GOLD_ARR), _d7, "cio", _bad_year, 3)
+            _ok7, _msg7 = False, "没有抛错"
+        except Exception as _exc7:          # noqa: BLE001
+            _ok7 = getattr(_exc7, "status_code", None) == 400
+            _msg7 = str(getattr(_exc7, "detail", _exc7))
+        check(_ok7, ".npy 受理：year=%d 被 400（不在序列年表里）" % _bad_year, _msg7)
+
+    # --- A7.6 按年份定位（3.1/3.2/3.5）：2020 必须能取到，AC2 口径不变
+    _dpy = ((default_params_job.get("projection") or {}).get("daysPerYear"))
+    _src_dir = JOB_ROOT / default_params_job["jobId"]
+    _series21 = np.load(_src_dir / "series.npy", allow_pickle=False)
+    _dates21 = cd._read_json(_src_dir / "dates.json")
+    check(bool(_dpy) and isinstance(_series21.size, int) and _series21.size == 2352,
+          "A7.6 前提：21 年真件序列 2352 点 + 投影年表在手",
+          (_series21.size, None if not _dpy else len(_dpy)))
+    check(lp.locate_year_window({2000 + k: 112 for k in range(21)}, 2020, 2352) == 2240,
+          "A7.6：逐年累加定位 2020 -> 2240",
+          lp.locate_year_window({2000 + k: 112 for k in range(21)}, 2020, 2352))
+    _sel20, _meta20 = lp._prepare_cio(
+        _series21, calendar={"daysPerYear": _dpy, "year": 2020})
+    check(_meta20["windowStart"] == 2240 and _meta20["targetYear"] == 2020,
+          "A7.6：2020 的窗口起点 = 2240（首个落在基准之外的年份）",
+          {k: _meta20.get(k) for k in ("windowStart", "targetYear", "mode")})
+    check(_meta20["mode"] == "extended-base" and bool(_meta20.get("warning"))
+          and "2240" in _meta20["warning"] and "2020" in _meta20["warning"],
+          "A7.6：扩基准必须留痕（mode=extended-base + warning 写明 2240/2020）",
+          (_meta20.get("mode"), _meta20.get("warning")))
+    check(_sel20.size == 112 and _sel20.dtype == np.float32,
+          "A7.6：摘出的仍是 112 天 float32", (_sel20.size, _sel20.dtype))
+    check(_dates21[2240] == "2020-05-29" and _dates21[2351] == "2020-09-28",
+          "A7.6：2020 窗口 = 2020-05-29 … 2020-09-28（pre1 口径）",
+          (_dates21[2240], _dates21[2351]))
+    # 前序年缺月：只平移 + warning，不阻断（3.4）
+    _shift = dict(_dpy)
+    _shift[2005] = 56
+    check(lp.locate_year_window(_shift, 2020, 2352) == 2240 - 56,
+          "A7.6：前序年缺月只让起点平移（2020 -> 2184）",
+          lp.locate_year_window(_shift, 2020, 2352))
+    _sel_s, _meta_s = lp._prepare_cio(
+        _series21, calendar={"daysPerYear": _shift, "year": 2020})
+    check("2005" in (_meta_s.get("warning") or "")
+          and _meta_s["windowStart"] == 2240 - 56,
+          "A7.6：前序年缺月列出该年、不阻断（warning 非空）",
+          (_meta_s.get("windowStart"), _meta_s.get("warning")))
+    # 目标年自身不足 112 天：硬拒（3.1）
+    _bad = dict(_dpy)
+    _bad[2020] = 84
+    try:
+        lp.locate_year_window(_bad, 2020, 2352)
+        _ok_bad, _msg_bad = False, "没有抛错"
+    except ValueError as _exc_bad:
+        _ok_bad, _msg_bad = "2020" in str(_exc_bad), str(_exc_bad)
+    check(_ok_bad, "A7.6：目标年只有 84 天 -> ValueError（不补齐、不降级）", _msg_bad)
+
+    # --- A7.7 目录分支：缺件错误指向**该组目录**（三参形式，不泄绝对路径）
+    # ⚠ 这里必须用 `real_inference`（本文件开头留的**原始**函数对象），不能用
+    # `lp._run_archive_inference` —— A 段前面几节把后者换成了打桩推理，
+    # 打桩对谁都不抛错，断言会变成恒真的"没有抛错"。
+    _real_roots = lp.MODEL_ROOTS
+    lp.MODEL_ROOTS = [TMP_BASE / "a7_no_such_root"]
+    try:
+        try:
+            real_inference(np.zeros(lp.N_STEPS, np.float32),
+                           lead="pre10", year=2011)
+            _ok7b, _msg7b = False, "没有抛错"
+        except FileNotFoundError as _exc7b:
+            _safe = lp._safe_exc(_exc7b)
+            _ok7b = ("2011" in _safe
+                     and not any(m in _safe for m in _a7_path_markers))
+            _msg7b = _safe
+        except Exception as _exc7b:          # noqa: BLE001
+            _ok7b, _msg7b = False, repr(_exc7b)
+    finally:
+        lp.MODEL_ROOTS = _real_roots
+    check(_ok7b, "A7.7：目录源缺件 -> 三参 FileNotFoundError（文案无绝对路径）",
+          _msg7b)
+    # 外部根掉线（OSError）不得冒泡成 5xx（D4/R6）
+    _missing_root = TMP_BASE / "a7_missing_root"
+    lp.MODEL_ROOTS = [_missing_root]
+    try:
+        _live7 = lp.resolve_model_group("pre3", 2000)
+    finally:
+        lp.MODEL_ROOTS = _real_roots
+    check(_live7["available"] is False and bool(_live7.get("reason")),
+          "A7.7：根不存在 -> 优雅不可用（available=False + reason），不抛 OSError",
+          _live7)
+
+    # --- A7.8 目录分支共用的内层循环 + 尾部完整性检查（2.2/2.4）+ 组标识交叉断言（2.6）
+    import tarfile as _tar7                              # noqa: PLC0415
+    _grp = TMP_BASE / "a7_model_root" / "pre10" / "2011"
+    _grp.mkdir(parents=True, exist_ok=True)
+    _picked = 0
+    with _tar7.open(lp.MODEL_ARCHIVE, mode="r|gz") as _tf7:
+        for _m7 in _tf7:
+            if not _m7.isfile() or not _m7.name.endswith(".pt"):
+                continue
+            _leaf7 = _m7.name.replace("\\", "/").rsplit("/", 1)[-1]
+            if not lp.GROUP_MEMBER_RE.match(_leaf7):
+                continue
+            (_grp / _leaf7).write_bytes(_tf7.extractfile(_m7).read())
+            _picked += 1
+            if _picked >= 2:
+                break
+    check(_picked == 2, "A7.8 前提：从归档里取出 2 个真 checkpoint 当目录源", _picked)
+    _real_resolver = lp.resolve_model_group
+    _descriptor = {"lead": "pre10", "year": 2011, "available": True,
+                   "reason": None, "source": "dir", "files": 2, "bytes": 0,
+                   "directory": _grp}
+    lp.resolve_model_group = lambda lead, year: dict(_descriptor)
+    try:
+        try:
+            real_inference(np.zeros(lp.N_STEPS, np.float32),
+                           lead="pre10", year=2011)
+            _ok8, _msg8 = False, "没有抛错"
+        except RuntimeError as _exc8:
+            _ok8, _msg8 = "不完整" in str(_exc8), str(_exc8)
+        except Exception as _exc8:          # noqa: BLE001
+            _ok8, _msg8 = False, repr(_exc8)
+        check(_ok8, "A7.8：目录分支下尾部完整性检查仍生效（2/8181 -> RuntimeError）",
+              _msg8)
+        # 2.6：实际加载的组标识 == 请求的 (lead, year)，不等即 RuntimeError
+        lp.resolve_model_group = lambda lead, year: dict(
+            _descriptor, lead="pre3", year=2000)
+        try:
+            real_inference(np.zeros(lp.N_STEPS, np.float32),
+                           lead="pre10", year=2011)
+            _ok8b, _msg8b = False, "没有抛错"
+        except RuntimeError as _exc8b:
+            _txt8b = str(_exc8b)
+            _ok8b = ("pre10" in _txt8b and "11" in _txt8b
+                     and "pre3" in _txt8b and "2000" in _txt8b)
+            _msg8b = _txt8b
+        except Exception as _exc8b:          # noqa: BLE001
+            _ok8b, _msg8b = False, repr(_exc8b)
+        check(_ok8b, "A7.8：组标识不一致 -> RuntimeError（文案含两边组合）", _msg8b)
+    finally:
+        lp.resolve_model_group = _real_resolver
 
     # ============================================ B. 与旧路由逐位对拍
     print("B. 数值一致性：新链 vs /api/predict/jobs（打桩边界）")
@@ -739,9 +1065,12 @@ try:
     read_after_stage2 = {"n": None}
     read_counter = {"n": 0}          # 在计数桩里前向引用，此处先建
 
-    def counting_prepare(raw, pre_year=0):
+    def counting_prepare(raw, pre_year=0, *, calendar=None, **kw):
+        # `calendar` 是 import-all-models 新增的 keyword-only 形参（年表定位窗口）；
+        # 计数桩必须原样**转发**，否则会悄悄按 `preYear` 老口径归一化，
+        # 本段后面「与阶段③ 喂入的张量逐位一致」的断言就名不副实了。
         calls["n"] += 1
-        out = real_prepare(raw, pre_year)
+        out = real_prepare(raw, pre_year, calendar=calendar, **kw)
         read_after_stage2["n"] = read_counter["n"]
         return out
 
@@ -773,7 +1102,7 @@ try:
 
         real_infer_for_probe = lp._run_archive_inference
 
-        def probing_inference(cio, progress_callback=None, span=(3, 95)):
+        def probing_inference(cio, progress_callback=None, span=(3, 95), **kw):
             # 桩自己读本任务的落盘件：③ 的执行边界内该读什么就读什么
             path = JOB_ROOT / read_scope["jobId"] / "normalized_window.npy"
             on_disk = (np_load_real(path, allow_pickle=False)
@@ -790,7 +1119,7 @@ try:
             )
             return fake_inference(cio, progress_callback, span)
 
-        def stage3_reporter(cio, progress_callback=None, span=(3, 95)):
+        def stage3_reporter(cio, progress_callback=None, span=(3, 95), **kw):
             def spy(progress, stage):
                 # ⚠ 这里抓到的是**回调给的原始值**（span 两端 33/97），不是
                 # `_run_stage3` 最终写进任务状态的值 —— 拿它断言会漏掉二次映射
@@ -998,10 +1327,19 @@ try:
               sorted(p for p in paths if p.startswith("/api/chain")))
 
         # --- 实况对照的链路前缀（有实况时才成立）
+        # ⚠ 真值件的内容必须与被比较的任务**同源**，否则下面 `pred == truth` 恒假：
+        #   `jid`（zip 入口）的序列是**现投影**，`.npy 入口` 的序列是官方金标准
+        #   `GOLD_ARR`，两者实测 max|Δ| = 1.56e-07（同套件 C 段也只敢按 1e-6 判等）。
+        #   归一化后这点差落在 float32 的最后一个 ulp（实测窗口 max|Δ| = 5.96e-08），
+        #   `==` 必然为假 —— 与 import-all-models 无关（同一序列上，带不带 calendar
+        #   的窗口逐位相同；归因探针见 .harness/tmp/import-all-models/_d2_probe.py）。
+        #   改用 `npy_job`（与后面两个任务同为 GOLD_ARR 口径）造真值件，断言仍是
+        #   严格 `==`，且钉住的语义不变：端点吐出的实况就是**写进文件的那份值**。
         day = TRUTH_ROOT / "pre1" / "2000"
         day.mkdir(parents=True, exist_ok=True)
         truth = np.tile(
-            np.load(JOB_ROOT / jid / "normalized_window.npy").astype(np.float64),
+            np.load(JOB_ROOT / npy_job["jobId"]
+                    / "normalized_window.npy").astype(np.float64),
             (81, 101, 1))
         truth_file = "pre_1_2000(1)_20_40_100_125_0.25_real2.npy"
         np.save(day / truth_file, truth)
@@ -1251,20 +1589,44 @@ try:
 
             # ⑦ 同族的**第二个可达点**：路径不是第三方载荷，而是模块自己用 `%s`
             #    拼进 message 的（`cioproj.load_field` 的 `nc_dir=%s`）。成员名保留
-            #    年份（`_zip_years` 要认得出 2000，否则受理就 400），但月份给 12
-            #    —— 窗口只取 5–9 月，于是一天都没读到 → 抛带绝对目录的
-            #    `RuntimeError`。这条只有**通用剥离**挡得住，钉住"不是只修一处特例"。
-            odd_job = _bad_input_case(
-                "nc 名不匹配",
-                build_zip(NCS, name_of=lambda _p, i:
-                          "cesm.u850.anom.daily.20001202-28days_%02d.nc" % i))
+            #    年份（`_zip_years` 要认得出 2000），但月份给 12 —— 窗口只取 5–9 月，
+            #    于是一天都没读到 → 抛带绝对目录的 `RuntimeError`。这条只有**通用
+            #    剥离**挡得住，钉住"不是只修一处特例"。
+            #    ⚠ 2026-09-21 契约变更（import-all-models）：受理阶段新增"目标年
+            #    5–9 月必须齐"的**必要**条件预判（frontend-contract §2），链路入口
+            #    对这份载荷**同步 400** —— 该可达点在链路侧按契约失效（守卫没丢，
+            #    是被提前拦下了）。旧路由 `/api/predict` 的受理口本轮**不动**
+            #    （红线：不碰 prediction.py），同一份载荷仍能走到 `load_field`，
+            #    所以"模块自抛的绝对**目录**也要被剥掉"这条覆盖**改由旧路由承载**，
+            #    断言一条不减。
+            odd_payload = build_zip(
+                NCS, name_of=lambda _p, i:
+                "cesm.u850.anom.daily.20001202-28days_%02d.nc" % i)
+            resp = client.post(
+                "%s?year=2000&lead=pre1&which=u850" % CHAIN_PREFIX,
+                files={"file": ("cesm.uwnd.5-9.zip", odd_payload,
+                                "application/zip")})
+            check(resp.status_code == 400 and "[5, 6, 7, 8, 9]" in resp.text,
+                  "nc 名不匹配：链路受理同步 400（目标年 5–9 月缺失，"
+                  "不再是跑完才炸）",
+                  "%s %s" % (resp.status_code, resp.text[:160]))
+            check(_DRIVE_RE.search(resp.text) is None,
+                  "nc 名不匹配：链路 400 文案里没有绝对路径", resp.text[:200])
+            legacy_odd = legacy_client.post(
+                "/api/predict/jobs?year=2000&lead=pre1&which=u850",
+                files={"file": ("cesm.uwnd.5-9.zip", odd_payload,
+                                "application/zip")})
+            check(legacy_odd.status_code == 202,
+                  "nc 名不匹配：旧路由受理仍 202（受理只看名字）",
+                  "%s %s" % (legacy_odd.status_code, legacy_odd.text[:160]))
+            odd_job = wait(legacy_odd.json()["jobId"], prefix="/api/predict/jobs")
             odd_err = odd_job.get("error") or ""
             check(odd_job.get("status") == "failed",
                   "nc 名不匹配：任务终态 failed", odd_job.get("status"))
             check(_DRIVE_RE.search(odd_err) is None,
                   "执行路径 error 里模块自抛的绝对目录也被剥掉", odd_err[:200])
             check_no_leak(odd_job, "nc 名不匹配：整份响应递归扫不到绝对路径")
-            shutil.rmtree(JOB_ROOT / odd_job["jobId"], ignore_errors=True)
+            shutil.rmtree(lp.JOB_ROOT / odd_job["jobId"], ignore_errors=True)
 
         finally:
             lp._run_archive_inference = real_archive_infer

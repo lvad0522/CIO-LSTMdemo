@@ -60,7 +60,9 @@ _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chain")
 
-# 受理校验的唯一规则表：全链与只跑投影不分工，都是 year=2000 & lead=pre1
+# 受理默认值（**不再是唯一规则表**，变更 import-all-models §4.1）：不传
+# `year`/`lead` 时仍按 2000/pre1 受理，行为与变更前逐字一致；传了则查可用性
+# （`prediction.resolve_model_group`，与 `GET /api/chain/models` 同一谓词）。
 FIXED_YEAR = 2000
 FIXED_LEAD = "pre1"
 
@@ -208,11 +210,26 @@ def _truth_path(job: dict) -> Path:
 # ------------------------------------------------------------- 受理校验
 
 def _parse_lead(lead: str) -> int:
-    """`pre{n}` → n；格式不对统一按权重未覆盖处理（与旧路由文案一致）。"""
+    """`pre{n}` → n。**格式非法**与"组合不可用"是两种失败，文案必须分开。"""
     match = prediction.LEAD_RE.match((lead or "").strip())
     if match is None:
-        raise HTTPException(400, "当前模型验证仅支持 year=2000、lead=pre1")
+        raise HTTPException(
+            400, f"lead 格式非法：{lead!r}（应为 preN 形式，如 pre3）"
+        )
     return int(match.group(1))
+
+
+def _require_available(lead: str, year: int) -> dict:
+    """受理闸门：`(lead, year)` 必须指向一个**可用权重组**（design D4）。
+
+    与 `GET /api/chain/models` 查**同一份**实现（`prediction.resolve_model_group`）：
+    清单里 `available:true` ⇔ 这里放行，反之亦然。不可用 ⇒ 400 带组合标识与原因，
+    原因里没有绝对路径。
+    """
+    group = prediction.resolve_model_group(lead, year)
+    if not group["available"]:
+        raise HTTPException(400, f"{lead}/{year}：{group['reason']}")
+    return group
 
 
 def _mat_identity(required: bool) -> dict:
@@ -263,6 +280,22 @@ def _resolve_npy_which(which: str) -> str:
     raise HTTPException(400, "which 只能是 u850 / sst / both / auto")
 
 
+def _zip_months_by_year(zip_path: Path) -> dict[int, list[int]]:
+    """从 zip 成员名数出每年有哪些月（不解压）。只做**必要**条件预判。"""
+    months: dict[int, set[int]] = {}
+    with zipfile.ZipFile(zip_path) as archive:
+        for member in archive.infolist():
+            if member.is_dir():
+                continue
+            name = PurePosixPath(member.filename.replace("\\", "/")).name
+            match = prediction.NC_YEAR_RE.search(name)
+            if match:
+                months.setdefault(int(match.group(1)), set()).add(
+                    int(match.group(2))
+                )
+    return {year: sorted(items) for year, items in months.items()}
+
+
 def _intake_zip(content: bytes, job_dir: Path, which: str, filename: str,
                 year: int, lead: int) -> dict:
     """`.zip` 受理：全程 O(1) 级校验（解压与投影留在后台）。"""
@@ -271,6 +304,7 @@ def _intake_zip(content: bytes, job_dir: Path, which: str, filename: str,
 
     kind, kind_source = _resolve_zip_kind(which, filename)
     identity = _mat_identity(required=True)
+    label = f"pre{lead}/{year}"
 
     try:
         years = prediction._zip_years(zip_path)
@@ -280,7 +314,19 @@ def _intake_zip(content: bytes, job_dir: Path, which: str, filename: str,
         raise HTTPException(
             400,
             f"zip 里没有 {year} 年的 nc（现有年份 {years[0]}–{years[-1]}）；"
-            f"模型 pre1/{year} 需要该年作为预测目标年。",
+            f"模型 {label} 需要该年作为预测目标年。",
+        )
+
+    # 目标年必须齐 5–9 月：缺月 ⇒ 窗口必然不足 112 天，**早 400**比跑完投影再失败
+    # 好得多。这里只判"文件在不在"（必要条件）；充分性由阶段② 的真实
+    # `days_per_year` 兜底（design D8 的权威判据）。**前序年缺月不拒**，只警告。
+    have = _zip_months_by_year(zip_path).get(year, [])
+    missing = [month for month in cioproj.MONTHS if month not in have]
+    if missing:
+        raise HTTPException(
+            400,
+            f"{label}：zip 里 {year} 年缺 {missing} 月的 nc，"
+            f"摘不出 {prediction.N_STEPS} 天窗口。",
         )
 
     return {
@@ -298,7 +344,11 @@ def _intake_zip(content: bytes, job_dir: Path, which: str, filename: str,
 
 def _intake_npy(content: bytes, job_dir: Path, which: str, year: int,
                 lead: int) -> tuple[dict, dict]:
-    """`.npy` 受理：预校验（`_prepare_cio`）并立刻落盘 series.npy。"""
+    """`.npy` 受理：预校验（`_prepare_cio`）并立刻落盘 series.npy。
+
+    `.npy` 不含年表 ⇒ 由序列长度造**均匀**年表后走**同一条** `calendar` 通道
+    （design D7）；年不在表里或窗口越界 ⇒ 受理阶段就 400，不留到后台。
+    """
     requested = _resolve_npy_which(which)
     try:
         raw = np.load(io.BytesIO(content), allow_pickle=False)
@@ -308,7 +358,9 @@ def _intake_npy(content: bytes, job_dir: Path, which: str, year: int,
     if flat.ndim > 1:
         flat = np.squeeze(flat)
     try:
-        _selected, normalization = prediction._prepare_cio(flat, pre_year=0)
+        _selected, normalization = prediction._prepare_cio(
+            flat, calendar=prediction.uniform_year_calendar(flat.size, year)
+        )
     except ValueError as exc:
         raise HTTPException(400, f"CIO 文件校验失败: {exc}") from exc
 
@@ -321,7 +373,7 @@ def _intake_npy(content: bytes, job_dir: Path, which: str, year: int,
         _completeness_path(job_dir), diagnostics._npy_completeness(int(series.size))
     )
 
-    return {
+    projection = {
         "inputKind": "cio-npy",
         "kind": "cio",
         "kindSource": "upload",
@@ -331,7 +383,12 @@ def _intake_npy(content: bytes, job_dir: Path, which: str, year: int,
         "seriesLength": int(series.size),
         # 阶段① 没跑，资产身份仍尽力给一份：取得到就显示，取不到就不显示该行
         **_mat_identity(required=False),
-    }, normalization
+    }
+    # 造年表用 `size // 112`，余数不参与但必须留痕（否则"最后一截去哪了"没法排查）
+    remainder = int(series.size % prediction.N_STEPS)
+    if remainder:
+        projection["seriesRemainder"] = remainder
+    return projection, normalization
 
 
 # ------------------------------------------------------------- 三段执行
@@ -390,6 +447,26 @@ def _run_zip_stage1(job_id: str, job_dir: Path, projection: dict, lead: int,
     return series
 
 
+def _window_calendar(job_id: str, series: np.ndarray) -> dict:
+    """② 的窗口年表：调用点只传「年表 + 目标年」，定位全在 `_prepare_cio` 内（design D6）。
+
+    * `.zip` —— 用① 从 U850 序列里读出来的**真实年表**（`projection.daysPerYear`，
+      由 `_run_zip_stage1` 写进任务状态）。**这就是"遍历这个 U850、摘取对应的年份
+      与对应的天数"的落点**：谁的年表、就摘谁的天数。
+    * `.npy` —— 文件里没有年份元信息，由序列长度造均匀年表；**同一条**定位逻辑，
+      不另写"按纪元换算偏移"的第二套实现（D7）。
+
+    年份读任务状态而不是入参 `projection`：`.zip` 的年表是① 跑完才有的，而
+    `_run_chain_job` 传给② 的 `projection` 仍是受理时那一份（`_advance` 是写状态，
+    不是改这个局部 dict）。
+    """
+    state = _get_job(job_id).get("projection") or {}
+    days_per_year = state.get("daysPerYear")
+    if isinstance(days_per_year, dict) and days_per_year:
+        return {"daysPerYear": days_per_year, "year": state.get("year")}
+    return prediction.uniform_year_calendar(series.size, state.get("year"))
+
+
 def _run_stage2(job_id: str, job_dir: Path, projection: dict) -> np.ndarray:
     """② 归一化：读落盘的 series.npy → normalized_window.npy（float32）。"""
     report = _report(job_id, STAGE2_SPAN)
@@ -398,7 +475,9 @@ def _run_stage2(job_id: str, job_dir: Path, projection: dict) -> np.ndarray:
     if not path.is_file():
         raise RuntimeError("归一化前找不到落盘的 series.npy")
     series = np.load(path, allow_pickle=False)
-    selected, normalization = prediction._prepare_cio(series, pre_year=0)
+    selected, normalization = prediction._prepare_cio(
+        series, calendar=_window_calendar(job_id, series)
+    )
     np.save(_normalized_path(job_dir), selected, allow_pickle=False)
 
     # 阶段① 在 `_advance` 里已写过自己的 warning（缺月提示，来自 cioproj
@@ -444,8 +523,11 @@ def _run_stage3(job_id: str, job_dir: Path, lead: str, year: int) -> None:
     def report(progress: int, stage: str) -> None:
         _update_job(job_id, progress=progress, stage=stage)
 
+    # 接线是硬要求（design D9）：默认值只保证"旧路由不传即冻结"，新路径必须显式
+    # 传组标识 —— 漏传会静默回退到 pre1/2000，受理、窗口、进度全都正常，只有权重
+    # 是别组的。目录分支内还有一道组标识交叉断言兜底（tasks 2.6）。
     prediction_array = prediction._run_archive_inference(
-        cio, report, span=INFERENCE_SPAN
+        cio, report, span=INFERENCE_SPAN, lead=lead, year=year
     )
     report(97, "正在保存 prediction.npy")
     np.save(_prediction_path(job_dir), prediction_array, allow_pickle=False)
@@ -543,6 +625,17 @@ def _run_chain_job(job_id: str, projection: dict, only_projection: bool,
 
 # ------------------------------------------------------------------ 路由
 
+@router.get("/models")
+def chain_model_groups():
+    """可用权重组清单（AC3，design D4）：实时扫盘、无缓存，**不含任何磁盘路径**。
+
+    与受理口（`_require_available`）共用同一个谓词 ⇒ 清单里 `available:true`
+    ⇔ `POST /api/chain/jobs` 会受理，反之亦然。`available` 是唯一权威判据，
+    `files`/`bytes` 只作展示。
+    """
+    return {"leads": prediction.list_model_groups()}
+
+
 @router.post("/jobs", status_code=202)
 async def create_chain_job(
     file: UploadFile = File(...),
@@ -553,14 +646,13 @@ async def create_chain_job(
 ):
     """一次提交承载整条链：`.zip` 从① 开始，`.npy` 跳过①、从② 开始。
 
-    参数说明：`year` / `lead` 固定为 2000 / pre1（唯一规则表）；`which` 在
-    `.zip` 下交给 `_resolve_kind`，在 `.npy` 下只认 空 / auto / cio；
-    `onlyProjection=true` 只跑①②（不加载任何 `.pt`）。
+    参数说明：`year` / `lead` 默认 2000 / pre1（**默认值，不是唯一规则表**）——
+    是否受理由"该组合是否指向一个可用权重组"决定，与 `GET /api/chain/models`
+    查同一份实现；`which` 在 `.zip` 下交给 `_resolve_kind`，在 `.npy` 下只认
+    空 / auto / cio；`onlyProjection=true` 只跑①②（不加载任何 `.pt`）。
     """
-    # 规则表唯一：全链与只跑投影同一套，文案与旧 `/api/predict/jobs` 逐字一致
-    if year != FIXED_YEAR or lead != FIXED_LEAD:
-        raise HTTPException(400, "当前模型验证仅支持 year=2000、lead=pre1")
-    lead_index = _parse_lead(lead)
+    lead_index = _parse_lead(lead)         # 格式非法 → 400（与"组合不可用"分开）
+    _require_available(lead, year)         # 不可用 → 400（带组合标识与原因）
 
     name = file.filename or ""
     suffix = PurePosixPath(name.replace("\\", "/")).suffix.lower()
@@ -802,27 +894,42 @@ def chain_pearson(job_id: str, confidence: float = Query(0.95)):
     }
 
 
+def _job_combo(job: dict) -> tuple[str, int]:
+    """下载文案用的**实际** `(lead, year)`：取任务状态里的 `projection`。
+
+    取数禁忌（前端口径同一份，见 frontend-contract §3）：不得取自查询参数或前端
+    选择状态 —— 任务跑完后选择状态仍可被改掉，会造成"文件名与实际权重不符"。
+    老任务缺键时回落到默认组合，保持 `pre1/2000` 逐字不变。
+    """
+    projection = job.get("projection") or {}
+    lead_index = projection.get("lead")
+    year = projection.get("year")
+    lead = (f"pre{lead_index}" if isinstance(lead_index, int)
+            else FIXED_LEAD)
+    return lead, (year if isinstance(year, int) else FIXED_YEAR)
+
+
 @router.get("/jobs/{job_id}/download/cio")
 def download_cio(job_id: str):
     """投影CIO，`(1, T)` `.npy` —— `.zip` 入口 T=2352，可直接与官方件对拍。"""
     job, series = _require_series(job_id)
+    lead, year = _job_combo(job)
     payload = io.BytesIO()
     np.save(payload, np.reshape(np.asarray(series, dtype=np.float64), (1, -1)),
             allow_pickle=False)
     payload.seek(0)
-    return _npy_response(payload, f"projected_cio_{FIXED_LEAD}_{FIXED_YEAR}.npy")
+    return _npy_response(payload, f"projected_cio_{lead}_{year}.npy")
 
 
 @router.get("/jobs/{job_id}/download/normalized")
 def download_normalized(job_id: str):
     """归一化窗口 `(112,) float32`，与阶段③ 喂入模型的张量逐位一致。"""
-    _job, selected = _require_normalized(job_id)
+    job, selected = _require_normalized(job_id)
+    lead, year = _job_combo(job)
     payload = io.BytesIO()
     np.save(payload, np.asarray(selected, dtype=np.float32), allow_pickle=False)
     payload.seek(0)
-    return _npy_response(
-        payload, f"normalized_window_{FIXED_LEAD}_{FIXED_YEAR}.npy"
-    )
+    return _npy_response(payload, f"normalized_window_{lead}_{year}.npy")
 
 
 def _npy_response(payload: io.BytesIO, filename: str) -> StreamingResponse:
@@ -835,22 +942,24 @@ def _npy_response(payload: io.BytesIO, filename: str) -> StreamingResponse:
 
 @router.get("/jobs/{job_id}/download/prediction")
 def download_prediction(job_id: str):
-    _job, path = _require_prediction(job_id)
+    job, path = _require_prediction(job_id)
+    lead, year = _job_combo(job)
     return FileResponse(
         path,
         media_type="application/octet-stream",
-        filename=f"prediction_{FIXED_LEAD}_{FIXED_YEAR}.npy",
+        filename=f"prediction_{lead}_{year}.npy",
     )
 
 
 @router.get("/jobs/{job_id}/download/pearson")
 def download_pearson(job_id: str):
     job, path = _require_prediction(job_id)
+    lead, year = _job_combo(job)
     r_path = _pearson_path(path.parent)
     if not r_path.is_file():
         raise HTTPException(404, "相关系数图产物不存在")
     return FileResponse(
         r_path,
         media_type="application/octet-stream",
-        filename=f"pearson_r_{FIXED_LEAD}_{FIXED_YEAR}.npy",
+        filename=f"pearson_r_{lead}_{year}.npy",
     )

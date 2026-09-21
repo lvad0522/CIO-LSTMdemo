@@ -248,8 +248,12 @@ else:
 
     real_inference = lp._run_archive_inference
 
-    def fake_inference(cio, progress_callback=None, span=(3, 95)):
-        """桩：不读 8181 个权重，直接回一个由 cio 铺出来的场。"""
+    def fake_inference(cio, progress_callback=None, span=(3, 95), **kw):
+        """桩：不读 8181 个权重，直接回一个由 cio 铺出来的场。
+
+        `**kw` 吸收 `_run_archive_inference` 新增的 keyword-only `lead`/`year`
+        （import-all-models §6.1：只同步签名，不改断言口径）。
+        """
         if progress_callback:
             progress_callback(span[0], "桩推理开始")
             progress_callback(span[1], "桩推理结束")

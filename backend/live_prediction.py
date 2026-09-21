@@ -21,15 +21,24 @@
   ① `.npy`  —— 训练同口径的一维 projected CIO 序列（112 / 2240 / 官方 2352）
   ② `.zip`  —— 原始气象场（5–9 月逐日 nc，21 年 × 5 月），走 `cioproj` 现场投影
 
-两条路径最终都落到 `_prepare_cio`，再顺序读取 pre1_2000.tar.gz 中的 8181
-个格点模型，生成 (81, 101, 112) 的预测降水数组。
+两条路径最终都落到 `_prepare_cio`，再逐格点读权重生成 (81, 101, 112) 的预测降水数组。
+权重的来源有两条（变更 `import-all-models`）：
+
+  · `(pre1, 2000)`  —— 冻结的 tar 归档 `MODEL_ARCHIVE`（流式读 8181 个成员），
+                       是回归基线，加载与前向口径**逐位不变**。
+  · 其余 `(lead, year)` —— `MODEL_ROOTS` 下的散装目录 `{root}/{lead}/{year}/NN_NNN.pt`，
+                       受理阶段即按 `count == 8181 && Σsize == 1558039617 && 坐标全覆盖`
+                       判完整性，只读被请求的那一组。
 
 归一化口径（对 `src/src/prediction.py:54-88` 与 `main_India_new.py:17` 复现）：
-  先把序列截/取到训练长度 2240，对整段做 min-max，再按年切 [112k : 112(k+1)]。
+  先把序列截/取到训练长度 2240，对整段做 min-max，再按目标年切 112 天。
+  目标年**按序列自带的年表逐年累加天数**定位（`locate_year_window`），
+  落在 2240 之后时才把基准扩到覆盖它并置 `mode="extended-base"` + warning。
   checkpoint 不含 CIO 的 min/max，所以尺度一致性取决于输入序列本身与训练同源。
 
-当前仅开放 year=2000、lead=pre1（已接入的权重只有这一组）；其余组合等权重到位
-后自然放开。SST 分支缺原始场与预处理源码，按 `cioproj` 的约定直接报错。
+旧路由 `/api/predict/jobs` 与 `/api/cio/*` 仍只受理 year=2000、lead=pre1（域没变，
+默认年槽 0 在那里是正确值）；链路 `/api/chain/jobs` 的 `(year, lead)` 已放开，
+见 `resolve_model_group` / `list_model_groups`。
 """
 
 from __future__ import annotations
@@ -75,6 +84,37 @@ JOB_ROOT = Path(os.environ.get(
     "PREDICTION_JOB_ROOT",
     BACKEND_DIR / "uploads" / "prediction_jobs",
 ))
+
+# ── 权重组目录源（变更 import-all-models，design D1/D2）─────────────────────
+# 散装权重目录形如 `{root}/{lead}/{year}/NN_NNN.pt`。`MODEL_ROOTS` **顺序即优先级**：
+# 解析 `(lead, year)` 时按根顺序取**第一个**存在该组目录的根，命中即用。
+# 默认只用仓库内的演示子集；env `MODEL_ROOTS`（`os.pathsep` 分隔）可整体覆盖为多根
+# （例如「本地根 + 外部盘根」）。模块加载时求值，但**解析函数每次调用时读模块属性**，
+# 这样测试可以猴补（与 `MODEL_ARCHIVE` 同一条惯例）。
+DEFAULT_MODEL_ROOTS = [PROJECT_ROOT / "model" / "服务器模型_pt"]
+_MODEL_ROOTS_ENV = os.environ.get("MODEL_ROOTS", "").strip()
+MODEL_ROOTS: list[Path] = (
+    [Path(item) for item in _MODEL_ROOTS_ENV.split(os.pathsep) if item.strip()]
+    if _MODEL_ROOTS_ENV else list(DEFAULT_MODEL_ROOTS)
+)
+
+# 组完整性判据（design D2）：数量 + 字节和 + 坐标全覆盖。三者都**实测**过：
+# 仓库内每一组完整权重的这三个值都相同（8181 / 1558039617），所以单看数量与字节和
+# 分不出"内容属于哪一组"—— 它们只用来判"是不是完整的这一组"。
+GROUP_FILE_COUNT = EXPECTED_MODELS
+GROUP_TOTAL_BYTES = 1558039617
+# 成员名形状：**全串锚定**，与归档分支的 `MODEL_NAME_RE`（带 `pre1/2000/` 前缀）
+# 并存不替换 —— 归档里的成员名带目录前缀，目录里的是裸名。
+GROUP_MEMBER_RE = re.compile(r"^(\d{2})_(\d{2,3})\.pt$")
+
+# 候选网格（tasks 1.5）：4 lead × 9 年 = 36 项，外加冻结归档 pre1/2000，共 37 项。
+# **可用组数是动态的**（权重仍在下载）：清单一律实时扫盘，不写死可用数量。
+GROUP_LEADS = ("pre3", "pre5", "pre10", "pre15")
+GROUP_YEARS = (2000, 2002, 2003, 2005, 2007, 2008, 2009, 2010, 2012)
+FROZEN_LEAD = "pre1"
+FROZEN_YEAR = 2000
+# `.npy` 入口没有年份元信息，序列首年按此常量视作 2000 年（design D7）
+SERIES_EPOCH_YEAR = 2000
 
 # CIO 模态固定资产：投影 ∝ e 的后 3321 列。真件在服务器
 # /mnt/mydisk2/zxy/data/rain/CIOmode_1982_2017.mat，需手工放入 assets/。
@@ -219,17 +259,81 @@ def _safe_exc(exc: BaseException) -> str:
     return _scrub_abs_paths(f"{type(exc).__name__}: {exc}")
 
 
+def locate_year_window(
+    days_per_year: dict, year: int, size: int, span: int = N_STEPS
+) -> int:
+    """按**逐年累加实际天数**定位 `year` 在序列里的起点偏移（design D5-1）。
+
+        start = Σ days_per_year[y] for y in sorted(days_per_year) if y < year
+
+    **不换算年槽**、**不用** `(year - 2000) * 112` 这类位置公式：年槽概念在任一年
+    缺月时都无定义（`pre_year = years.index(year)` 会静默取到错的 112 天）。
+
+    三条受理条件缺一即 `ValueError`（调用点转 400 / 任务失败）：
+      ① 年表含 `year`；② `days_per_year[year] == span`；③ `start + span <= size`。
+    """
+    if not days_per_year:
+        raise ValueError("序列没有年表（daysPerYear），无法按年份定位窗口")
+    try:
+        table = {int(key): int(value) for key, value in dict(days_per_year).items()}
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"年表格式不正确：{days_per_year!r}") from exc
+    if year not in table:
+        years = sorted(table)
+        raise ValueError(
+            f"目标年 {year} 不在序列年表里（现有 {years[0]}–{years[-1]} 共 "
+            f"{len(years)} 年）"
+        )
+    if table[year] != span:
+        raise ValueError(
+            f"目标年 {year} 在序列里只有 {table[year]} 天（窗口需要 {span} 天），"
+            "摘不出完整的 112 天窗口"
+        )
+    start = sum(table[key] for key in sorted(table) if key < year)
+    if start + span > int(size):
+        raise ValueError(
+            f"目标年 {year} 的窗口 [{start}, {start + span}) 超出序列长度 {size}"
+        )
+    return int(start)
+
+
+def uniform_year_calendar(size: int, year: int | None = None) -> dict:
+    """`.npy` 入口的年表：按 `SERIES_EPOCH_YEAR` 起造**均匀**年表（design D7）。
+
+    文件里没有年份元信息，常量纪元是唯一不动上传契约的确定化方式。`.npy` 与 `.zip`
+    **走同一条** `locate_year_window`，只是年表来源不同（这里造、那里读 U850 的）——
+    禁止另写一套"按纪元换算偏移"的实现，两套实现必然漂移。
+    """
+    span = N_STEPS
+    return {
+        "daysPerYear": {
+            SERIES_EPOCH_YEAR + k: span for k in range(int(size) // span)
+        },
+        "year": year,
+    }
+
+
 def _prepare_cio(
-    raw: np.ndarray, pre_year: int = 0
+    raw: np.ndarray, pre_year: int = 0, *, calendar: dict | None = None
 ) -> tuple[np.ndarray, dict]:
-    """按训练侧口径准备第 `pre_year` 年的 112 天 CIO。
+    """按训练侧口径准备目标年的 112 天 CIO。
 
     复现 src/src/main_India_new.py:17 的 `cio[:, :2240]` 与
     src/src/prediction.py 的 `normalize` + `input[112k : 112(k+1)]`：
-    先把序列截到训练长度 2240，对**整段**做 min-max，再按年切块。
+    先把序列截到训练长度 2240，对**整段**做 min-max，再按目标年切块。
 
-    长度策略：
-      T ≥ 2240  截前 2240，mode="training-equivalent"（官方 2352 点件走这条）
+    **两种入口（design D6）**：
+
+    * `calendar=None`（旧路由 `/api/predict` 与 `/api/cio`）—— 行为与变更前
+      **逐位一致**：按年槽 `pre_year` 切 `[112k : 112(k+1)]`，基准恒为前 2240 点。
+    * `calendar={"daysPerYear": {...}, "year": Y}` —— 在**切片前**用
+      `locate_year_window` 按年份定位（不满足其三条受理条件即 `ValueError`），
+      归一化基准 `base_end = min(size, max(2240, start + 112))`：
+        - `base_end == 2240` ⇒ 与上游 `cio[:, :2240]` 同口径，`mode` 逐字不变；
+        - `base_end > 2240` ⇒ `mode="extended-base"` **且**带 warning（扩基准会改变
+          归一化取值，绝不静默）。
+
+    长度策略（`base_end < 2240` 时）：
       112 ≤ T < 2240  整段自归一，mode="partial" + warning（缺月份的真实序列）
       T < 112   报错
     """
@@ -251,10 +355,41 @@ def _prepare_cio(
     if not np.all(np.isfinite(arr)):
         raise ValueError("CIO 数组包含 NaN 或无穷值")
 
-    if arr.size >= TRAIN_SEQ_LEN:
-        base, mode = arr[:TRAIN_SEQ_LEN], "training-equivalent"
+    warnings: list[str] = []
+    if calendar is None:
+        start = N_STEPS * pre_year
+        target_year = None
     else:
-        base, mode = arr, "partial"
+        target_year = int(calendar.get("year"))
+        table = {int(k): int(v) for k, v in
+                 dict(calendar.get("daysPerYear") or {}).items()}
+        start = locate_year_window(table, target_year, arr.size)
+        # 前序年缺月**不阻断**（design D8）：定位按实际天数累加，缺月只让窗口
+        # 相对 `pre{N}` 约定平移。平移必须留痕，否则就是新的静默偏差。
+        shifted = [key for key in sorted(table)
+                   if key < target_year and table[key] != N_STEPS]
+        if shifted:
+            warnings.append(
+                "前序年份 %s 在窗口内不是 %d 天，目标年 %s 的窗口相对训练约定有平移"
+                "（按实际天数累加定位）。" % (shifted, N_STEPS, target_year)
+            )
+
+    base_end = min(arr.size, max(TRAIN_SEQ_LEN, start + N_STEPS))
+    base = arr[:base_end]
+    if base_end < TRAIN_SEQ_LEN:
+        mode = "partial"
+        warnings.append(
+            f"序列只有 {arr.size} 点（< 训练长度 {TRAIN_SEQ_LEN}，通常因为缺月份），"
+            "按现有长度整段 min-max；尺度与训练不完全一致。"
+        )
+    elif base_end == TRAIN_SEQ_LEN:
+        mode = "training-equivalent"
+    else:
+        mode = "extended-base"
+        warnings.append(
+            f"归一化基准已从 {TRAIN_SEQ_LEN} 扩到 {base_end} 点以覆盖目标年 "
+            f"{target_year}，与训练口径存在偏差。"
+        )
 
     cio_min = float(np.min(base))
     cio_max = float(np.max(base))
@@ -262,7 +397,6 @@ def _prepare_cio(
         raise ValueError("CIO 数组为常数，无法执行 min-max 归一化")
 
     normalized = (base - cio_min) / (cio_max - cio_min)
-    start = N_STEPS * pre_year
     selected = normalized[start:start + N_STEPS].astype(np.float32, copy=False)
 
     meta = {
@@ -271,15 +405,14 @@ def _prepare_cio(
         "usedLength": int(base.size),
         "preYear": pre_year,
         "selectedRange": [start, start + N_STEPS],
+        # 目标年定位留痕（tasks 3.2）：`preYear`/`selectedRange` 保持原键不动，
+        # 新增的两个键只增不改 —— 前端契约按它们核对窗口。
+        "targetYear": target_year,
+        "windowStart": start,
         "cioMin": cio_min,
         "cioMax": cio_max,
-        "warning": None,
+        "warning": " ".join(warnings) if warnings else None,
     }
-    if mode == "partial":
-        meta["warning"] = (
-            f"序列只有 {arr.size} 点（< 训练长度 {TRAIN_SEQ_LEN}，通常因为缺月份），"
-            "按现有长度整段 min-max；尺度与训练不完全一致。"
-        )
     return selected, meta
 
 
@@ -547,6 +680,170 @@ def _npy_job_input(content: bytes, job_dir: Path) -> tuple[dict, Callable]:
     return normalization, prepare
 
 
+# ------------------------------------------------- 权重组目录源（多根 + 完整性）
+
+def _scan_group_directory(directory: Path) -> dict:
+    """`os.scandir` **单次**枚举拿文件数、字节和与坐标覆盖（design D2）。
+
+    实测 10 ms/组（8181 个条目），把"这组能不能做"从事后 30 分钟提前到受理时
+    十几毫秒。只统计**形状匹配**的成员：目录里若混进 README 之类不影响判定，
+    但少一个 `.pt` 或坐标不齐一定会被下面的三条判据之一抓到。
+    """
+    files = 0
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    detail: list[str] = []
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            # 不跟随符号链接：链接指出去的"权重"不属于这一组
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            match = GROUP_MEMBER_RE.match(entry.name)
+            if match is None:
+                continue
+            index, column = int(match.group(1)), int(match.group(2))
+            files += 1
+            total += entry.stat(follow_symlinks=False).st_size
+            if not (0 <= index < GRID_ROWS and 0 <= column < GRID_COLS):
+                detail.append(f"越界 {entry.name}")
+                continue
+            if (index, column) in seen:
+                detail.append(f"重复 ({index}, {column})")
+                continue
+            seen.add((index, column))
+
+    problem = None
+    if files != GROUP_FILE_COUNT:
+        problem = f"该组权重不完整（{files}/{GROUP_FILE_COUNT} 个文件）"
+    elif len(seen) != GRID_ROWS * GRID_COLS:
+        # 数量凑对了但格点盖不满（重复或越界）—— "跨组混装/中断后凑回原值"
+        # 的典型形态，只看数量与字节和抓不到（design D2 的 C 案）。
+        problem = ("该组权重格点未全覆盖（%d/%d 个坐标，异常 %d 个：%s）"
+                   % (len(seen), GRID_ROWS * GRID_COLS, len(detail),
+                      "；".join(detail[:3])))
+    elif total != GROUP_TOTAL_BYTES:
+        problem = f"该组权重字节数不符（{total} != {GROUP_TOTAL_BYTES}）"
+    return {"files": files, "bytes": total, "problem": problem}
+
+
+def resolve_model_group(lead: str, year: int) -> dict:
+    """**唯一**的权重组解析入口（design D4）：清单端点与受理口共用它。
+
+    按 `MODEL_ROOTS` 顺序找**第一个**存在该组目录的根，命中即用；命中后目录里的
+    完整性判据不满足，也**不再**往下找别的根（"哪一组算数"必须可预测）。
+
+    返回组描述符；**不可用不抛异常**：外部盘掉线、权限不足、目录半截都只是
+    "该组合不可用＋原因"，不得冒泡成 5xx（R6）。`directory` 是唯一的内部字段
+    （绝对路径），清单一律不带它出去。
+
+    `(pre1, 2000)` 标记 `source="archive"`：走冻结的 tar 归档分支，**不**参与目录
+    枚举（tar 用不了同一套目录判据，design D3）。
+    """
+    descriptor = {
+        "lead": lead, "year": year, "available": False, "reason": None,
+        "source": None, "files": 0, "bytes": 0, "directory": None,
+    }
+    if lead == FROZEN_LEAD and year == FROZEN_YEAR:
+        descriptor.update(source="archive", available=True)
+        return descriptor
+    if LEAD_RE.match((lead or "").strip()) is None:
+        descriptor["reason"] = f"lead 格式非法：{lead!r}（应为 preN，如 pre3）"
+        return descriptor
+
+    for root in MODEL_ROOTS:
+        directory = Path(root) / lead / str(year)
+        # 布局守卫：目录由**已校验的入参**拼成，末两段必须恰为 `{lead}/{year}`，
+        # 不递归、不跟随符号链接（否则"这一组的身份"就不可证了）。
+        if tuple(directory.parts[-2:]) != (lead, str(year)):
+            descriptor["reason"] = f"模型根布局不符（末两段不是 {lead}/{year}）"
+            continue
+        if not directory.is_dir():
+            continue
+        try:
+            scanned = _scan_group_directory(directory)
+        except OSError as exc:
+            # 外部根掉线 / 权限不足 / 盘符消失。文案**只带异常类名**：
+            # `str(OSError)` 通常含绝对路径，而它会进响应（R3）。
+            descriptor["reason"] = f"模型根不可访问（{type(exc).__name__}）"
+            continue
+        descriptor.update(directory=directory, files=scanned["files"],
+                          bytes=scanned["bytes"], source="dir")
+        descriptor["reason"] = scanned["problem"]
+        descriptor["available"] = scanned["problem"] is None
+        return descriptor
+
+    if descriptor["reason"] is None:
+        descriptor["reason"] = "未找到该组权重目录"
+    return descriptor
+
+
+def list_model_groups() -> list[dict]:
+    """可用组合清单（tasks 1.5 / design D4）：**逐组**调 `resolve_model_group`。
+
+    严禁"先列全部目录再筛"：外部根可能整个不存在，列目录要么先炸要么先慢。
+    返回项**不含磁盘路径**；`available` 是唯一权威的可选判据，`files`/`bytes`
+    只作展示（实测每组完整权重的这两个值都一样，自己算不出来"可用"）。
+    """
+    catalog = []
+    for lead in GROUP_LEADS + (FROZEN_LEAD,):
+        years = (FROZEN_YEAR,) if lead == FROZEN_LEAD else GROUP_YEARS
+        items = []
+        for year in years:
+            group = resolve_model_group(lead, year)
+            item = {
+                "year": int(year),
+                "available": bool(group["available"]),
+                "files": int(group["files"]),
+                "bytes": int(group["bytes"]),
+                # 候选网格里除 `pre1/2000`（archive）之外都是目录权重；不可用且
+                # 未命中任何根时按 "dir" 报，前端**不要**用它反推 available。
+                "source": group["source"] or "dir",
+            }
+            if not item["available"]:
+                item["reason"] = group["reason"] or "该组合不可用"
+            items.append(item)
+        catalog.append({"lead": lead, "years": items})
+    return catalog
+
+
+# ------------------------------------------------- 权重组加载（两条分支共用循环）
+
+def _iter_archive_members():
+    """归档分支的枚举 seam：产出 `(i, j, 权重字节, 成员名)`。
+
+    成员名原样透出（错误文案与变更前逐字一致）。
+    """
+    with tarfile.open(MODEL_ARCHIVE, mode="r|gz") as archive:
+        for member in archive:
+            if not member.isfile() or not member.name.endswith(".pt"):
+                continue
+            match = MODEL_NAME_RE.search(member.name.replace("\\", "/"))
+            if not match:
+                continue
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise RuntimeError(f"无法读取模型: {member.name}")
+            yield int(match.group(1)), int(match.group(2)), stream.read(), member.name
+
+
+def _iter_directory_members(directory: Path, lead: str, year: int):
+    """目录分支的枚举 seam：产出 `(i, j, 权重字节, 标签)`。
+
+    标签用**相对**路径（`{lead}/{year}/{name}`）：错误文案会进响应，
+    绝对路径不上（R3）。
+    """
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            match = GROUP_MEMBER_RE.match(entry.name)
+            if match is None:
+                continue
+            yield (int(match.group(1)), int(match.group(2)),
+                   Path(entry.path).read_bytes(),
+                   f"{lead}/{year}/{entry.name}")
+
+
 def _build_model(torch, checkpoint: dict):
     """依据 checkpoint 元数据构造与 src/src/model.py 一致的网络。"""
     nn = torch.nn
@@ -631,16 +928,61 @@ def _run_archive_inference(
     cio: np.ndarray,
     progress_callback=None,
     span: tuple[int, int] = (3, 95),
+    *,
+    lead: str = FROZEN_LEAD,
+    year: int = FROZEN_YEAR,
 ) -> np.ndarray:
-    """流式读取 gzip tar，逐格点执行前向推理。
+    """按权重组逐格点执行前向推理。
 
     `span` 是进度条区间：投影阶段占掉前面一段，推理从 span[0] 推到 span[1]。
+
+    **两条分支**（design D3/D9）：
+
+    * 不传 `lead`/`year`（旧路由 `/api/predict/jobs` 与 `/api/cio`，以及 `chain.py`
+      里任何未接线的调用点）⇒ 默认 `pre1/2000`，走既有的 tar 归档流式读 ——
+      这是**回归基线**，8181 加载与前向口径逐位不变。
+    * 传了 ⇒ 按 `resolve_model_group` 解析：`pre1/2000` 仍走归档，其余组合走目录
+      源。两条分支**共用**同一个内层循环（`torch.load` → `_build_model` →
+      `load_state_dict(strict=True)` → `eval` → `inference_mode` → `nan_to_num` →
+      负值置 0 → 反归一化 → 进度），禁止复制两份前向代码。
+
+    ⚠ 默认值只保证"旧路由不传即冻结"。**新路径必须靠调用点显式接线**（`chain.py`
+    的 `_run_stage3` 传 `lead=`/`year=`）：单靠默认值的话，漏传会**静默回退**到
+    pre1/2000 —— 受理过了、窗口也对了、任务 completed，实际却用别组的权重去算 r。
+    这正是本变更要消灭的静默错数的新形态，所以目录分支内还有一道组标识交叉断言。
     """
-    if not MODEL_ARCHIVE.is_file():
-        # 三参形式：单参 `FileNotFoundError(f"...{MODEL_ARCHIVE}")` 的 `.filename`
-        # 是 None，`_safe_exc` 会走 else 原样吐出绝对路径（这个 error 串前端上屏，
-        # R3-4）。填了 filename 才让总闸真正生效。
-        raise FileNotFoundError(errno.ENOENT, "模型压缩包不存在", str(MODEL_ARCHIVE))
+    group = None
+    if lead == FROZEN_LEAD and year == FROZEN_YEAR:
+        if not MODEL_ARCHIVE.is_file():
+            # 三参形式：单参 `FileNotFoundError(f"...{MODEL_ARCHIVE}")` 的
+            # `.filename` 是 None，`_safe_exc` 会走 else 原样吐出绝对路径（这个
+            # error 串前端上屏，R3-4）。填了 filename 才让总闸真正生效。
+            raise FileNotFoundError(
+                errno.ENOENT, "模型压缩包不存在", str(MODEL_ARCHIVE)
+            )
+    else:
+        group = resolve_model_group(lead, year)
+        if not group["available"]:
+            # 缺件错误保持**三参**形式：第三参给该组目录（未命中任何根时给按布局
+            # 拼出的"本该在那儿"的路径）。`.filename` 一填，`_safe_exc` 就只透出
+            # basename，绝对路径不上响应。
+            if group["directory"] is not None:
+                missing_path = group["directory"]
+            elif MODEL_ROOTS:
+                missing_path = Path(MODEL_ROOTS[0]) / lead / str(year)
+            else:                                 # 根列表为空：只能给相对形状
+                missing_path = Path(lead) / str(year)
+            raise FileNotFoundError(
+                errno.ENOENT,
+                group["reason"] or "该组权重不可用",
+                str(missing_path),
+            )
+        # 交叉断言（tasks 2.6）：实际加载的组标识 == 请求的 (lead, year)。
+        if group["lead"] != lead or group["year"] != year:
+            raise RuntimeError(
+                "权重组标识不一致：请求 %s/%s，实际解析到 %s/%s"
+                % (lead, year, group["lead"], group["year"])
+            )
 
     # 当前 Windows/Anaconda 环境的 NumPy 与 PyTorch 可能各自携带 OpenMP。
     # 这是本地验证兼容设置；后续部署应统一运行时依赖后移除。
@@ -671,67 +1013,64 @@ def _run_archive_inference(
     processed = 0
 
     if progress_callback:
-        progress_callback(span[0], "正在打开模型压缩包")
+        progress_callback(
+            span[0],
+            "正在打开模型压缩包" if group is None
+            else f"正在读取权重目录 {lead}/{year}",
+        )
 
     # ⚠ 为什么不是 `with torch.serialization.safe_globals(safe_types)`：见上面
     # `_permanent_safe_globals` 的类文档（B-8：那个 CM 退出时无条件摘除全局
     # allowlist，并发双任务必挂）。
     with _permanent_safe_globals(torch, safe_types):
-        with tarfile.open(MODEL_ARCHIVE, mode="r|gz") as archive:
-            for member in archive:
-                if not member.isfile() or not member.name.endswith(".pt"):
-                    continue
-                match = MODEL_NAME_RE.search(member.name.replace("\\", "/"))
-                if not match:
-                    continue
+        members = (
+            _iter_archive_members() if group is None
+            else _iter_directory_members(group["directory"], lead, year)
+        )
+        for i, j, member_bytes, label in members:
+            if not (0 <= i < GRID_ROWS and 0 <= j < GRID_COLS):
+                raise RuntimeError(f"模型坐标越界: {label}")
+            if (i, j) in seen:
+                raise RuntimeError(f"模型坐标重复: ({i}, {j})")
 
-                i, j = int(match.group(1)), int(match.group(2))
-                if not (0 <= i < GRID_ROWS and 0 <= j < GRID_COLS):
-                    raise RuntimeError(f"模型坐标越界: {member.name}")
-                if (i, j) in seen:
-                    raise RuntimeError(f"模型坐标重复: ({i}, {j})")
+            checkpoint = torch.load(
+                io.BytesIO(member_bytes),
+                map_location="cpu",
+                weights_only=True,
+            )
+            if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+                raise RuntimeError(f"checkpoint 结构不正确: {label}")
 
-                stream = archive.extractfile(member)
-                if stream is None:
-                    raise RuntimeError(f"无法读取模型: {member.name}")
-                checkpoint = torch.load(
-                    io.BytesIO(stream.read()),
-                    map_location="cpu",
-                    weights_only=True,
+            model = _build_model(torch, checkpoint)
+            model.load_state_dict(checkpoint["state_dict"], strict=True)
+            model.eval()
+            with torch.inference_mode():
+                normalized_pred = model(input_tensor).reshape(-1).numpy()
+
+            # 与旧 prediction.py 一致：NaN/负的归一化输出先置 0，再反归一化。
+            normalized_pred = np.nan_to_num(
+                normalized_pred, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            normalized_pred[normalized_pred < 0] = 0
+            precip_min = float(checkpoint["precip_min"])
+            precip_max = float(checkpoint["precip_max"])
+            prediction[i, j, :] = (
+                normalized_pred * (precip_max - precip_min) + precip_min
+            ).astype(np.float32, copy=False)
+
+            seen.add((i, j))
+            processed += 1
+            if progress_callback and (
+                processed == 1 or processed % 25 == 0 or processed == EXPECTED_MODELS
+            ):
+                lo, hi = span
+                progress = lo + int(processed / EXPECTED_MODELS * (hi - lo))
+                progress_callback(
+                    progress,
+                    f"正在推理格点 {processed}/{EXPECTED_MODELS}",
                 )
-                if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
-                    raise RuntimeError(f"checkpoint 结构不正确: {member.name}")
 
-                model = _build_model(torch, checkpoint)
-                model.load_state_dict(checkpoint["state_dict"], strict=True)
-                model.eval()
-                with torch.inference_mode():
-                    normalized_pred = model(input_tensor).reshape(-1).numpy()
-
-                # 与旧 prediction.py 一致：NaN/负的归一化输出先置 0，再反归一化。
-                normalized_pred = np.nan_to_num(
-                    normalized_pred, nan=0.0, posinf=0.0, neginf=0.0
-                )
-                normalized_pred[normalized_pred < 0] = 0
-                precip_min = float(checkpoint["precip_min"])
-                precip_max = float(checkpoint["precip_max"])
-                prediction[i, j, :] = (
-                    normalized_pred * (precip_max - precip_min) + precip_min
-                ).astype(np.float32, copy=False)
-
-                seen.add((i, j))
-                processed += 1
-                if progress_callback and (
-                    processed == 1 or processed % 25 == 0 or processed == EXPECTED_MODELS
-                ):
-                    lo, hi = span
-                    progress = lo + int(processed / EXPECTED_MODELS * (hi - lo))
-                    progress_callback(
-                        progress,
-                        f"正在推理格点 {processed}/{EXPECTED_MODELS}",
-                    )
-
-                del model, checkpoint, normalized_pred
+            del model, checkpoint, normalized_pred
 
     if processed != EXPECTED_MODELS:
         missing = EXPECTED_MODELS - processed
