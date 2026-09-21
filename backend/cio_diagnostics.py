@@ -2,12 +2,44 @@
 
 该路由只负责 CIO 输入、真实模态资产和投影诊断，不加载 LSTM 模型。当前真实可运行
 的原始场分支只有 U850；SST 与 SST+U850 联合投影保留稳定契约并明确返回不可用。
+
+── 冻结声明（2026-09-21，变更 retire-legacy-job-routes）──────────────────
+本模块被 `main.py` 挂载的**只剩资产面 4 条**（见文件末尾 import 期组装的
+`asset_router`：capabilities / reference / mode/u850 / spectrum）。以下内容
+**原地保留，不得当死代码删除**：
+
+1. `router` 的 5 条 `/jobs*` 任务路由，与其**本模块自有的**编排 helper
+   `_run_npy_job` / `_run_zip_job` —— 它们是**已退役公开面的差分 oracle**。
+   `POST /api/cio/jobs` 及其 4 条产物端点已于 2026-09-21 从 `main.app` 摘除
+   （功能等价出口为 `/api/chain/jobs*`），但本模块整体保留，由
+   `test_cio_diagnostics.py` / `test_chain_api.py` 通过**自建内存 app** 驱动。
+   **注意编排 helper 不在同一个模块里**（按"本模块 grep 不到就删"会误判）：
+   `_run_job` / `_npy_job_input` / `_zip_job_input` 定义在
+   **`live_prediction.py`**，**归那份冻结声明管**；本模块的 CIO 分支
+   （`_run_npy_job` / `_run_zip_job`）**不经过** `_run_job` —— 后者只被
+   `live_prediction.py` 自己的 `/jobs` POST 调用。
+   （此处不写行号：冻结声明的正确性不该随本文件的任何编辑而失效。）
+2. `chain.py` **直接 import 本模块的内部函数**（`diagnostics.*` 共 **11 处引用 /
+   7 个 distinct 私有符号**：`_normalize_confidence` / `_npy_completeness` /
+   `_read_json` / `_reference_for_dates` / `_spectrum_payload` / `_write_json` /
+   `_zip_completeness`）。删掉它们**不是"只有跑到冷分支才炸"**，须按符号区分：
+   `_npy_completeness` 与 `_write_json` 在 **`.npy` 受理路径上被无条件调用**
+   （`chain.py:320-322`，即 `_intake_npy` 内，删了当场 `AttributeError`，
+   并被 `test_chain_api.py` 的 npy 受理段真跑到）；其余 5 个只在
+   `.zip` 阶段性落盘（`_run_zip_stage1`）、序列 / 完备性 / 谱 / 置信度归一化
+   分支上被调用。按"只有旧路由在用"判定某 helper 可删，会漏掉这一层。
+
+解冻条件（三者同时成立才可删）见
+`.harness/adr/ADR-001-retire-legacy-job-routes.md` —— **请指向该 ADR（稳定路径），
+不要引用 `design.md`**（它随本变更归档迁到 `spec/changes/archive/` 下）。
+──────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import threading
 import time
@@ -651,3 +683,58 @@ def cio_job_spectrum(job_id: str, confidence: float = Query(0.95)):
     source = "u850-only" if job.get("projectionMode") == "u850_only" else "uploaded-cio"
     actual = _reference_for_dates(dates) if dates is not None else None
     return _spectrum_payload(values, dates, level, source, actual_values=actual)
+
+
+# ==================================================== 资产面 router（退役变更）
+# 现网 `/api/cio/*` 只挂**资产面 4 条**；5 条任务路由（`/jobs*`）已从 `main.app`
+# 退役，其 `router` 原地保留为 test-only 差分 oracle（见模块顶部冻结声明 + ADR-001）。
+#
+# 组装必须发生在 **import 期**：`include_router` 保存的是 include 那一刻拿到的
+# router 对象引用。实测三变体 —— 原地改 `routes` 会传播（V1）；**先筛后挂**有效
+# （V2，本处采用）；名字重绑定无效（V3，父 app 手上还是旧对象）。放在模块底部组装、
+# `main.py` 之后才 `import` 本模块，于是模块名字 `asset_router` 从一开始就是
+# "已筛选的组成体"，不依赖"父 app 持有的是引用"这一实现细节。
+#
+# 判据用 **exact match**，不用 `startswith("/api/cio/")`（该前缀同时覆盖资产与
+# 任务，会把 5 条任务路由一起留在资产面 ⇒ 退役失败）；也不用 `/jobs` 前缀反向剔除
+# （`/api/cio/jobs` 是 `/api/cio/jobs/{job_id}` 的字符串前缀，且 `/api/cio/spectrum`
+# 与 `/api/cio/jobs/{job_id}/spectrum` 极易写混，写错一侧资产面会整体掉）。
+#
+# 资产面 = **无 `job_id` 依赖、不写 `uploads/`、无状态幂等**。
+CIO_ASSET_PATHS = (
+    "/api/cio/capabilities",
+    "/api/cio/reference",
+    "/api/cio/mode/u850",
+    "/api/cio/spectrum",
+)
+ASSET_ROUTER_PREFIX = "/api/cio"
+
+asset_router = APIRouter(prefix=ASSET_ROUTER_PREFIX, tags=["cio-diagnostics"])
+# 与下方 `router` **共享同一批 handler 对象**（不复制函数、不重新定义）——
+# 「资产端点不重复实现」的判据是**实现本体唯一**，不是路由条数。
+asset_router.routes.extend(
+    [r for r in router.routes if r.path in CIO_ASSET_PATHS]
+)
+
+# 组装期硬校验：判据写错时从**静默**变成**启动即炸**。
+# 必须用显式 `raise` 而非 `assert` —— 实测 `-O` / `PYTHONOPTIMIZE` 下 assert 会被
+# **剥离**，组装校验会静默消失，"判据写错 → 启动即炸"的全部依托随之失效。
+_asset_paths_got = sorted(r.path for r in asset_router.routes)
+_asset_paths_want = sorted(CIO_ASSET_PATHS)
+if len(asset_router.routes) != len(CIO_ASSET_PATHS) or _asset_paths_got != _asset_paths_want:
+    raise RuntimeError(
+        "cio_diagnostics.asset_router 组装错误：期望恰 %d 条 %s，实测 %d 条 %s"
+        % (len(CIO_ASSET_PATHS), _asset_paths_want,
+           len(asset_router.routes), _asset_paths_got)
+    )
+if asset_router.prefix != ASSET_ROUTER_PREFIX:
+    raise RuntimeError(
+        "cio_diagnostics.asset_router 前缀错误：期望 %r，实测 %r"
+        % (ASSET_ROUTER_PREFIX, asset_router.prefix)
+    )
+_asset_bleed = [r.path for r in asset_router.routes if "/jobs" in r.path]
+if _asset_bleed:
+    raise RuntimeError(
+        "cio_diagnostics.asset_router 混入任务路由（资产面判据被污染）：%s" % _asset_bleed
+    )
+del _asset_paths_got, _asset_paths_want, _asset_bleed

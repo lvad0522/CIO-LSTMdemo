@@ -1,5 +1,21 @@
 """逐格点 LSTM checkpoint 在线推理。
 
+── 冻结声明（2026-09-21，变更 retire-legacy-job-routes）──────────────────
+本模块的 8 条 `/jobs*` 路由与 8 个 handler 是**已退役公开面的差分对拍 oracle**。
+`POST /api/predict/jobs` 及其 7 条产物端点已于 2026-09-21 从 `main.app` 摘除
+（功能等价出口为 `/api/chain/jobs*`），但本模块**整体原地保留**，由
+`test_predict_chain.py` / `test_chain_api.py` 通过**自建内存 app**
+（`FastAPI().include_router(live_prediction.router)`）驱动 —— 核心验收
+「数值一致性」的最强证据（新旧逐位对拍）依赖这条执行路径活着。
+
+  · **不得作为死代码删除**：删它等于"为了删死代码，先拆掉度量工具"，
+    验收强度会从"差分对拍"掉到"只剩磁盘基线"。
+  · 解冻条件（三者同时成立才可删）见
+    `.harness/adr/ADR-001-retire-legacy-job-routes.md` —— **请指向该 ADR
+    （稳定路径），不要引用 `design.md`**（它随本变更归档迁到
+    `spec/changes/archive/` 下）。
+──────────────────────────────────────────────────────────────────────────
+
 两条输入路径，共用同一套后台推理与结果接口：
 
   ① `.npy`  —— 训练同口径的一维 projected CIO 序列（112 / 2240 / 官方 2352）

@@ -29,16 +29,21 @@ from real_data import (
     gen_s2s_comparison,
     gen_results_table,
 )
-from live_prediction import router as live_prediction_router
-from cio_diagnostics import router as cio_diagnostics_router
+from cio_diagnostics import asset_router as cio_asset_router
 from chain import router as chain_router
 
 app = FastAPI(title="CIO+LSTM 降水预测 API")
-# 三个 router 前缀互不重叠：/api/predict（在线推理）、/api/cio（投影诊断）、
-# /api/chain（一条链）。`/api/chain` 是独立前缀，与另两个无路由冲突，
-# 也不吞掉它们任何端点（旧路由一行不改）。
-app.include_router(live_prediction_router)
-app.include_router(cio_diagnostics_router)
+# 两个 router 前缀互不重叠：/api/cio（投影诊断）、/api/chain（一条链）。
+# `/api/chain` 是独立前缀，与 /api/cio 无路由冲突，也不吞掉它任何端点。
+#
+# 2026-09-21 退役（变更 retire-legacy-job-routes）：`/api/cio/*` 现网**只挂资产面
+# 4 条**（capabilities / reference / mode/u850 / spectrum，由 `cio_diagnostics.py`
+# import 期按 exact path 组装的 `asset_router` 提供）。任务面 13 条 —— 8 条
+# `/api/predict/*` 与 5 条 `/api/cio/jobs*` —— 已从现网摘除，等价出口为
+# `/api/chain/jobs*`；对应 router 与全部 handler **原地保留为 test-only 差分
+# oracle**（由 `test_legacy_route_retirement.py` 等自建内存 app 驱动），
+# 解冻条件见 `.harness/adr/ADR-001-retire-legacy-job-routes.md`。
+app.include_router(cio_asset_router)
 app.include_router(chain_router)
 
 app.add_middleware(
@@ -149,8 +154,10 @@ def s2s_comparison():
 async def upload_data(file: UploadFile = File(...)):
     """遗留端点：只把 .npy 存到 backend/uploads/ 并回一个数组摘要，不跑任何模型。
 
-    真正的上传推理链路在 `live_prediction.py` 的 `POST /api/predict/jobs`
-    （受理 CIO `.npy` 与原始场 `.zip`，走投影 + 8181 个 checkpoint 前向）。
+    真正的上传推理链路是 `POST /api/chain/jobs`（受理 CIO `.npy` 与原始场
+    `.zip`，走投影 + 8181 个 checkpoint 前向）。原先此处指向的
+    `POST /api/predict/jobs` 已于 2026-09-21 退役（见
+    `.harness/adr/ADR-001-retire-legacy-job-routes.md`）。
     本端点前端已不再调用，保留仅为兼容旧脚本。
     """
     if not file.filename or not file.filename.lower().endswith(".npy"):
