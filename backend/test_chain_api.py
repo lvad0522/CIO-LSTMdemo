@@ -355,11 +355,23 @@ def fake_inference(cio, progress_callback=None, span=(3, 95)):
     return np.tile(cio.astype(np.float32), (lp.GRID_ROWS, lp.GRID_COLS, 1))
 
 
-def build_zip(nc_paths, inner="uwnd_5-9"):
+def build_zip(nc_paths, inner="uwnd_5-9", corrupt=False, name_of=None):
+    """打包 nc 成 zip。
+
+    `corrupt=True`  —— 成员名/目录结构照旧，只把 nc **内容**换成垃圾字节：
+                       T4-4 的载体（受理与解压只看名字，必然走到读 nc 才炸）。
+    `name_of`       —— 自定义成员名（收 (path, index)），用来造"月份一个都匹配
+                       不上"的第二种载体。
+    """
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in nc_paths:
-            zf.write(path, "%s/%s" % (inner, path.name))
+        for index, path in enumerate(nc_paths):
+            base = name_of(path, index) if name_of else path.name
+            name = "%s/%s" % (inner, base)
+            if corrupt:
+                zf.writestr(name, b"NOT-A-NETCDF-" + b"x" * 512)
+            else:
+                zf.write(path, name)
     return buf.getvalue()
 
 
@@ -1185,6 +1197,54 @@ try:
             finally:
                 lp.MODEL_ARCHIVE = real_model_archive
                 lp._run_archive_inference = fake_inference
+
+            # ⑥ **执行路径**上"路径只在 message 里、`.filename` 为空"的异常（T4-4）。
+            #    `.filename` 分支天然接不住这一类：`cioproj.read_nc()` 聚合四个 nc
+            #    后端后抛的是 `RuntimeError`（`.filename` 恒无），nc 的绝对路径写在
+            #    message 里 → 走 else 原样透出 → `error` 前端上屏（R3-4 同一条链）。
+            #    载体用**真**坏件：成员名/结构照旧，只把 nc 内容换成垃圾字节 ——
+            #    受理与解压都只看名字，所以必然一路走到读 nc 才炸。
+            def _bad_input_case(label, payload):
+                """投一份必然在**执行路径**上炸的 zip，返回终态 job。"""
+                resp = client.post(
+                    "%s?year=2000&lead=pre1&which=u850" % CHAIN_PREFIX,
+                    files={"file": ("cesm.uwnd.5-9.zip", payload,
+                                    "application/zip")})
+                check(resp.status_code == 202,
+                      "%s：受理仍 202（O(1) 校验只看名字）" % label,
+                      "%s %s" % (resp.status_code, resp.text[:160]))
+                return wait(resp.json()["jobId"])
+
+            bad_job = _bad_input_case("nc 内容坏", build_zip(NCS, corrupt=True))
+            bad_err = bad_job.get("error") or ""
+            check(bad_job.get("status") == "failed",
+                  "nc 内容坏：任务终态 failed", bad_job.get("status"))
+            check(bool(bad_err), "nc 内容坏：error 文案非空（不是闷失败）",
+                  bad_err[:160])
+            check(_DRIVE_RE.search(bad_err) is None,
+                  "执行路径 error 不含 <盘符>:<分隔符> 片段（message 带路径、"
+                  ".filename 为空）", bad_err[:200])
+            check_no_leak(bad_job,
+                          "执行路径失败的终态响应递归扫不到绝对路径（T4-4）")
+            shutil.rmtree(JOB_ROOT / bad_job["jobId"], ignore_errors=True)
+
+            # ⑦ 同族的**第二个可达点**：路径不是第三方载荷，而是模块自己用 `%s`
+            #    拼进 message 的（`cioproj.load_field` 的 `nc_dir=%s`）。成员名保留
+            #    年份（`_zip_years` 要认得出 2000，否则受理就 400），但月份给 12
+            #    —— 窗口只取 5–9 月，于是一天都没读到 → 抛带绝对目录的
+            #    `RuntimeError`。这条只有**通用剥离**挡得住，钉住"不是只修一处特例"。
+            odd_job = _bad_input_case(
+                "nc 名不匹配",
+                build_zip(NCS, name_of=lambda _p, i:
+                          "cesm.u850.anom.daily.20001202-28days_%02d.nc" % i))
+            odd_err = odd_job.get("error") or ""
+            check(odd_job.get("status") == "failed",
+                  "nc 名不匹配：任务终态 failed", odd_job.get("status"))
+            check(_DRIVE_RE.search(odd_err) is None,
+                  "执行路径 error 里模块自抛的绝对目录也被剥掉", odd_err[:200])
+            check_no_leak(odd_job, "nc 名不匹配：整份响应递归扫不到绝对路径")
+            shutil.rmtree(JOB_ROOT / odd_job["jobId"], ignore_errors=True)
+
         finally:
             lp._run_archive_inference = real_archive_infer
     finally:

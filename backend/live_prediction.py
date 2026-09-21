@@ -115,6 +115,44 @@ def _update_job(job_id: str, **changes) -> None:
             _jobs[job_id].update(changes)
 
 
+# ------------------------------------------------------- 异常文本脱敏
+
+# 路径片段的字符集：到空白/引号/括号/消息分隔标点为止 —— 那些是**消息的**
+# 分隔符，不是路径的一部分（路径里的 `/` `\` 保留）。
+_PATH_BODY = r"""[^\s"'`<>()\[\]{}|,;]"""     # 含路径分隔符
+_PATH_SEG = r"""[^\s"'`<>()\[\]{}|,;/]"""     # 段内字符（不含 `/`）
+_ABS_PATH_RES = (
+    # Windows 盘符：D:\a\b\x.nc / C:/a/b/x.nc。
+    # `(?<![A-Za-z])` 是为了不把 `https://` 的 `s:/` 当成盘符（前一字符是字母）。
+    re.compile(r"(?<![A-Za-z])[A-Za-z]:[\\/]" + _PATH_BODY + "*"),
+    # UNC：\\server\share\x.nc
+    re.compile(r"\\\\" + _PATH_BODY + "+"),
+    # POSIX 绝对路径：/a/b/x.nc（要求 ≥2 段，且不在词/URL 中间起头）
+    re.compile(r"(?<![\w./])/(?:" + _PATH_SEG + r"+/)+" + _PATH_SEG + "+"),
+)
+
+
+def _abs_path_to_leaf(match: "re.Match") -> str:
+    """把命中的绝对路径换成一个**只含文件名**的片段。"""
+    token = match.group(0).rstrip("\\/")          # 目录形式：结尾是分隔符
+    leaf = re.split(r"[\\/]", token)[-1]
+    return leaf or "<path>"
+
+
+def _scrub_abs_paths(text: str) -> str:
+    """剥掉异常文本里的**服务器绝对路径**，只留文件名，其余字符一个不动。
+
+    为什么不是"整个 message 一律丢弃"：`_safe_exc` 的 else 分支是**故意的诊断
+    出口** —— "预测场形状 (5,5,5) 与实况场 (3,3,3) 不一致" / "Cannot parse
+    header: ''" / "No data left in file" 全靠它原样透出，整条丢弃等于毁掉诊断。
+    所以这里只做**替换**：`D:\\…\\x.nc` → `x.nc`（与 `.filename` 分支同口径）。
+    """
+
+    for pattern in _ABS_PATH_RES:
+        text = pattern.sub(_abs_path_to_leaf, text)
+    return text
+
+
 def _safe_exc(exc: BaseException) -> str:
     """异常 → 可进响应的短串，绝不带绝对路径。
 
@@ -123,16 +161,18 @@ def _safe_exc(exc: BaseException) -> str:
     `error=` / `verification.reason` 直接进响应，`error` 还会被前端**上屏**
     （见 R3-4）。所以带 `.filename` 时只保留**文件名**。
 
-    不带 `.filename` 的一律原样返回 `str(exc)` —— 最有用的诊断信息全在这条
-    else 上：形状不一致（"预测场形状 (5, 5, 5) 与实况场 (3, 3, 3) 不一致"）、
-    npy 损坏（"Cannot parse header: ''"）、0 字节（"No data left in file"）。
-    无条件套 `[Errno None] None` 会把它们全毁掉。
+    不带 `.filename` 的走 `_scrub_abs_paths`：**只把绝对路径片段换成它的文件名**，
+    其余字符原样保留 —— 最有用的诊断信息全在这条 else 上：形状不一致（"预测场
+    形状 (5, 5, 5) 与实况场 (3, 3, 3) 不一致"）、npy 损坏（"Cannot parse
+    header: ''"）、0 字节（"No data left in file"）。无条件套 `[Errno None] None`
+    会把它们全毁掉；而无条件原样返回则会把 message 里的绝对路径透出去（T4-4）。
 
     ⚠ `.filename` **可能是 None**（实测 `OSError(ENOMEM)`：errno 有、filename
     没有），也可能是 bytes 或 int 文件描述符 —— `os.fsdecode` 只吃
     str/bytes/PathLike，其余按"没有文件名"处理，别让它把异常吞成 TypeError。
 
-    **覆盖范围（别扩大理解）**：本净化器只处理"异常自带 `.filename`"这一类。
+    **覆盖范围（别扩大理解）**：本净化器处理"异常自带 `.filename`"与"message
+    里带绝对路径"两类；**只剥路径片段，不改其余文案**（`_scrub_abs_paths`）。
     用点三处：执行路径上新旧两条路由**各一个**总闸（`_run_job` /
     `chain._run_chain_job`）+ 实况检验的 reason。**受理/校验路径**另有约 11
     处 `str(exc)` 出口**未纳入**，其中 `chain._mat_identity(required=False)` 的
@@ -155,7 +195,12 @@ def _safe_exc(exc: BaseException) -> str:
             errno_ = getattr(exc, "errno", None)
             head = f"[Errno {errno_}] " if errno_ is not None else ""
             return f"{head}{type(exc).__name__}: {os.path.basename(name)}"
-    return f"{type(exc).__name__}: {exc}"
+    # 没有 `.filename` 的走这里。**不能无条件原样返回**：message 里带绝对路径
+    # 而 `.filename` 为空的异常真实可达（`cioproj.read_nc` 的四后端聚合、
+    # `cioproj.load_field` 的 `nc_dir=%s`、`RuntimeError(f"包装: {inner}")`
+    # 这类包装异常）—— 实测它们会把 `D:\…\chain_jobs\<id>\raw\*.nc` 原样送进
+    # `error` 并前端上屏。所以这里过一道**只换路径、不动其余字符**的剥离。
+    return _scrub_abs_paths(f"{type(exc).__name__}: {exc}")
 
 
 def _prepare_cio(

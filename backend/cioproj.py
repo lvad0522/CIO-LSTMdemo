@@ -63,7 +63,11 @@ def read_nc(path: str) -> dict:
             ds.close()
             return out
         except Exception as exc:                      # noqa: BLE001
-            errs.append("%s: %r" % (lib, exc))
+            # 只记异常**类型**，不把 `%r` 载荷拼进 message：第三方库的原文里带着
+            # 它们自己的路径写法、文档 URL 和 `\n` 字面转义，会跟着这条
+            # `RuntimeError` 一路冒到 `prediction._safe_exc()` 的 else 分支，
+            # 最终**前端上屏**（T4-4）。类型已经能说明"哪个后端以什么方式失败"。
+            errs.append("%s: %s" % (lib, type(exc).__name__))
     raise RuntimeError("没有库能读 %s → %s" % (path, " | ".join(errs)))
 
 
