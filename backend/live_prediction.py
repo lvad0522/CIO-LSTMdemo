@@ -22,13 +22,28 @@
   ② `.zip`  —— 原始气象场（5–9 月逐日 nc，21 年 × 5 月），走 `cioproj` 现场投影
 
 两条路径最终都落到 `_prepare_cio`，再逐格点读权重生成 (81, 101, 112) 的预测降水数组。
-权重的来源有两条（变更 `import-all-models`）：
+权重的来源有两条（变更 `import-all-models`，网格扩到 400 组见 `expand-model-catalog`）：
 
   · `(pre1, 2000)`  —— 冻结的 tar 归档 `MODEL_ARCHIVE`（流式读 8181 个成员），
-                       是回归基线，加载与前向口径**逐位不变**。
+                       是回归基线，加载与前向口径**逐位不变**；归档优先级
+                       **无条件**高于任何目录根（外置盘上的同名目录永不读取）。
   · 其余 `(lead, year)` —— `MODEL_ROOTS` 下的散装目录 `{root}/{lead}/{year}/NN_NNN.pt`，
                        受理阶段即按 `count == 8181 && Σsize == 1558039617 && 坐标全覆盖`
                        判完整性，只读被请求的那一组。
+
+候选网格是**声明式区间常量**（`pre1..pre20` × `2000..2019` = 400），`available`
+才是盘面派生量。三根默认顺序见 `DEFAULT_MODEL_ROOTS`（仓库内 → E: → F:）。
+
+⚠ **两条已知耦合（写在此处，防止下一轮有人"重新发现"）**：
+
+  1. **扩权重批次必须同步扩 `GROUP_LEADS`/`GROUP_YEARS`**：网格是常量、盘面是
+     变量，二者会分叉；新批次若不在网格里，它**不会**出现在清单（不是标
+     `available:false`，而是根本不出现）。
+  2. **三项守卫只证"形状"、不证"内容身份"**：`count` / `bytes` / 坐标覆盖都是
+     格点形状决定的常量（实测三根只有两种 `.pt` 尺寸），所以任何"同样 8181 文件、
+     同样字节和、同样坐标覆盖"的另一版权重都会通过判定 ⇒ **"哪一版算数"完全由
+     `MODEL_ROOTS` 的顺序裁决，即"根顺序 = 版本优先级"**（D → E → F）。不得把
+     `available:true` 读作"权重内容已被验证正确"。
 
 归一化口径（对 `src/src/prediction.py:54-88` 与 `main_India_new.py:17` 复现）：
   先把序列截/取到训练长度 2240，对整段做 min-max，再按目标年切 112 天。
@@ -44,7 +59,10 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import io
+import json
+import logging
 import os
 import re
 import shutil
@@ -66,6 +84,9 @@ import mock_sandbox
 import verification
 
 
+logger = logging.getLogger("live_prediction")
+
+
 GRID_ROWS = 81
 GRID_COLS = 101
 N_STEPS = 112
@@ -85,13 +106,21 @@ JOB_ROOT = Path(os.environ.get(
     BACKEND_DIR / "uploads" / "prediction_jobs",
 ))
 
-# ── 权重组目录源（变更 import-all-models，design D1/D2）─────────────────────
-# 散装权重目录形如 `{root}/{lead}/{year}/NN_NNN.pt`。`MODEL_ROOTS` **顺序即优先级**：
-# 解析 `(lead, year)` 时按根顺序取**第一个**存在该组目录的根，命中即用。
-# 默认只用仓库内的演示子集；env `MODEL_ROOTS`（`os.pathsep` 分隔）可整体覆盖为多根
-# （例如「本地根 + 外部盘根」）。模块加载时求值，但**解析函数每次调用时读模块属性**，
-# 这样测试可以猴补（与 `MODEL_ARCHIVE` 同一条惯例）。
-DEFAULT_MODEL_ROOTS = [PROJECT_ROOT / "model" / "服务器模型_pt"]
+# ── 权重组目录源（变更 import-all-models，design D1/D2；expand-model-catalog 扩到 400）──
+# 散装权重目录形如 `{root}/{lead}/{year}/NN_NNN.pt`。`MODEL_ROOTS` **顺序即优先级**，
+# 且因三项守卫只证**形状**（见模块头注释的耦合 2），顺序即**版本优先级**：
+# 解析 `(lead, year)` 时按根顺序取**第一个完整**的组目录 —— 某根上目录**存在但
+# 未通过三项守卫**时继续试后续根（"第一个存在目录胜出"会把半截副本当成"有这一组"，
+# 让有完整权重的用户拿到 available:false 且**无法自救**：前端渲染为不可选）。
+# 默认三根（D3，顺序 = 优先级，**不依赖任何环境变量才生效**）：仓库内演示子集 →
+# `E:` → `F:`。env `MODEL_ROOTS`（`os.pathsep` 分隔的多值）可整体覆盖为多根。
+# 模块加载时求值，但**解析函数每次调用时读模块属性**，这样测试可以猴补
+# （与 `MODEL_ARCHIVE` 同一条惯例）。
+DEFAULT_MODEL_ROOTS = [
+    PROJECT_ROOT / "model" / "服务器模型_pt",   # D：仓库内演示子集（36 组）
+    Path("E:/服务器模型_pt"),                   # E：外置盘（pre1..pre20，多数 2000–2013）
+    Path("F:/服务器模型_pt"),                   # F：外置盘（pre1..pre20 × 2014–2019）
+]
 _MODEL_ROOTS_ENV = os.environ.get("MODEL_ROOTS", "").strip()
 MODEL_ROOTS: list[Path] = (
     [Path(item) for item in _MODEL_ROOTS_ENV.split(os.pathsep) if item.strip()]
@@ -107,14 +136,77 @@ GROUP_TOTAL_BYTES = 1558039617
 # 并存不替换 —— 归档里的成员名带目录前缀，目录里的是裸名。
 GROUP_MEMBER_RE = re.compile(r"^(\d{2})_(\d{2,3})\.pt$")
 
-# 候选网格（tasks 1.5）：4 lead × 9 年 = 36 项，外加冻结归档 pre1/2000，共 37 项。
-# **可用组数是动态的**（权重仍在下载）：清单一律实时扫盘，不写死可用数量。
-GROUP_LEADS = ("pre3", "pre5", "pre10", "pre15")
-GROUP_YEARS = (2000, 2002, 2003, 2005, 2007, 2008, 2009, 2010, 2012)
+# 候选网格（D2）：**声明式区间常量**，`pre1..pre20` × `2000..2019` = **400 项**。
+# **不得由扫盘派生**：从盘派生会让"外置盘缺席 ⇒ 那 364 组从清单里消失"，而前端
+# `isValidModelCatalog` 是 all-or-nothing（某个 lead 分组凭空少一组，整份清单被判
+# 非法、选择器回落成单一组合）。`available` 才是盘面派生量。
+# ⚠ 与盘面的耦合见模块头注释的耦合 1（**扩权重批次必须同步扩这两个常量**）。
+GROUP_LEADS = tuple("pre%d" % n for n in range(1, 21))     # 20 个提前期
+GROUP_YEARS = tuple(range(2000, 2020))                     # 20 个年份
+# 冻结归档 `pre1/2000` 的标识（`resolve_model_group` 的归档短路用；`list_model_groups`
+# **不再**为它写特例 —— 它只是 400 格里的一格，`source` 由谓词给出）。
 FROZEN_LEAD = "pre1"
 FROZEN_YEAR = 2000
 # `.npy` 入口没有年份元信息，序列首年按此常量视作 2000 年（design D7）
 SERIES_EPOCH_YEAR = 2000
+
+# ── 扫描缓存 / 落盘清单 / 预热的配置（D5/D6/D7）───────────────────────────
+# 落盘清单的目录是**模块级常量且可猴补**：测试套件把任务目录隔离到临时区
+# （`TMP_BASE`），若这里不可猴补，测试会读写**真实的** `backend/uploads/`，
+# 造成"测试之间通过磁盘互相影响"的隐蔽耦合。`backend/uploads/` 已被 `.gitignore`
+# 的 `uploads/` 规则覆盖（R11）。
+MODEL_SCAN_MANIFEST_DIR = BACKEND_DIR / "uploads"
+
+
+def _env_num(name: str, default, *, floor=None, cast=float):
+    """解析数值型 env：**解析失败或低于下限一律回落默认值并记警告**，绝不抛异常。
+
+    为什么不在导入期裸 `float()`（code-review C015）：下面三个常量都在 **import 期**求值，
+    env 写成非数字会让 `import live_prediction` 直接抛 `ValueError` —— 两个在线站点连
+    **启动**都失败（且是裸 traceback，看不出是哪个 env 的问题）。`floor` 是**拒绝阈值**
+    （不是夹取目标）：`MODEL_SCAN_TTL=0` 若"抬到下限 1 s 取"，会让后台轮次变成最快 1 轮/秒、
+    每轮最多 K 条 8181 条目全量枚举，**持续打外置盘** —— 而外置盘要留给两个站点跑推理。
+    ⇒ **低于下限与解析失败同解：记警告 + 回落默认值**（默认值即设计工况）。
+
+    **只作用于 env 解析**：测试直接改模块属性（如 `lp.MODEL_SCAN_TTL = 0.02`）不受下限约束。
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return cast(default)
+    try:
+        value = cast(float(raw))
+    except (TypeError, ValueError):
+        logger.warning("环境变量 %s=%r 不是数字，已回落默认值 %s", name, raw, default)
+        return cast(default)
+    if floor is not None and value < floor:
+        # **取值 < 下限 ⇒ 回落默认值，而不是"抬到下限"**：下限是**拒绝阈值**，不是夹取目标。
+        # 反例（本函数初版就这么写的，被 I.3 用例当场揪出）：`MODEL_SCAN_TTL=0` 抬到下限
+        # 1.0 s ⇒ 后台轮次 1 秒一轮、每轮最多 K 条 × 8181 条目 —— 与 `=0` 想防的
+        # "持续打外置盘"**一个量级**，等于该兜底没兜住。默认值 300 s 才是设计工况。
+        logger.warning("环境变量 %s=%r 低于下限 %s，不是可用取值，已回落默认值 %s",
+                       name, raw, floor, default)
+        return cast(default)
+    return value
+
+
+# 缓存兜底 TTL（PM 确认 300 s，env 可调）。**每次读模块属性**（与 `MODEL_ROOTS`
+# 同一条惯例），不在导入期固化成局部量。
+MODEL_SCAN_TTL = _env_num("MODEL_SCAN_TTL", 300.0, floor=1.0)
+# 请求路径**之外**的单轮重扫预算 K（每轮最多重扫几组）。K 必须是正整数语义：
+# 实现里取 `max(1, K)`，即 `K <= 0` 时仍至少重扫 1 条 —— "从不重扫"与"只在启动时
+# 预热一次"同属死参数，不算满足（C009）。
+MODEL_SCAN_BUDGET = _env_num("MODEL_SCAN_BUDGET", 4, floor=1, cast=int)
+# 单组扫描的**事后**保底判定（P4）：`os.scandir` 阻塞在系统调用里时 Python 无法
+# 抢占，所以这不是硬超时 —— 语义是"单组花掉超过这个时长 ⇒ 中止本轮后台扫描并
+# 记日志"，避免掉速/休眠的外置盘把后台轮次无限期拖住（**不得**把它说成硬超时）。
+MODEL_SCAN_STALL_LIMIT = _env_num("MODEL_SCAN_STALL_LIMIT", 30.0, floor=1.0)
+# 预热总开关（**默认开启**）。`0` 关掉的是**整个后台执行体**：启动预热与周期轮次
+# 都没有 ⇒ **TTL 兜底随之不生效**（逾期条目没有执行体去重扫）。这是显式选择的
+# 逃生口，代价已写进运行手册（C008），**不得**让运维以为 TTL 还在工作。
+MODEL_PREWARM = (
+    os.environ.get("MODEL_PREWARM", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
 
 # CIO 模态固定资产：投影 ∝ e 的后 3321 列。真件在服务器
 # /mnt/mydisk2/zxy/data/rain/CIOmode_1982_2017.mat，需手工放入 assets/。
@@ -727,17 +819,38 @@ def _scan_group_directory(directory: Path) -> dict:
 
 
 def resolve_model_group(lead: str, year: int) -> dict:
-    """**唯一**的权重组解析入口（design D4）：清单端点与受理口共用它。
+    """**唯一**的权重组解析入口（design D1/D4）：清单端点与受理口共用它。
 
-    按 `MODEL_ROOTS` 顺序找**第一个**存在该组目录的根，命中即用；命中后目录里的
-    完整性判据不满足，也**不再**往下找别的根（"哪一组算数"必须可预测）。
+    按 `MODEL_ROOTS` 顺序取**第一个完整**的组目录：某根上目录**不存在**、或
+    **存在但未通过三项守卫**时，都继续试后续根；命中一个完整根后**只读该组**，
+    不合并多根。（"第一个存在目录胜出"会把半截副本当成"有这一组"，与项目真值
+    脚本 `verify_local_archive.py` 的"只要有一份完整就算完整"给出相反答案。）
 
     返回组描述符；**不可用不抛异常**：外部盘掉线、权限不足、目录半截都只是
-    "该组合不可用＋原因"，不得冒泡成 5xx（R6）。`directory` 是唯一的内部字段
+    "该组合不可用＋原因"，不得冒泡成 5xx（R6/D11）。`directory` 是唯一的内部字段
     （绝对路径），清单一律不带它出去。
 
     `(pre1, 2000)` 标记 `source="archive"`：走冻结的 tar 归档分支，**不**参与目录
-    枚举（tar 用不了同一套目录判据，design D3）。
+    枚举（tar 用不了同一套目录判据，design D3）。**归档优先级无条件高于任何目录根**：
+    外置盘上那份同名目录**永远不被读取**（已知且有意的冗余 —— 该组合的价值正是
+    "不随盘面变化"）。
+
+    **全部根都未命中时** `reason` 按三档优先级取值（D8，规格 :251）：
+    ①某根上目录存在但未通过守卫（含实测文件数）＞②**根不可用**（盘符消失/未挂载/
+    根目录不存在，或访问时抛 `OSError`，附异常类名）＞③所有根上目录都不存在。
+    两个槽分别只写不覆盖（`specific` 收 ①、`unreach` 收 ②），收尾按 ①＞②＞③ 取 ——
+    若共用一个槽、每轮无条件覆盖，走到最后只会剩**最后一个失败根**的文案
+    （典型是"未找到"），等于用"未找到"掩盖"存在但半截"这一更具体的状态；
+    分两槽还保证"后一根的不可达"不会盖掉"前一根的半截"。
+
+    ⚠ **②的"根不可用"必须单独探测根目录本身**：盘符消失 / 外置盘未挂载时
+    `directory.is_dir()` 只返回 `False`（不抛，见下），与"这个根上确实没有这一组"
+    **同解** ⇒ 掉盘会伪装成"未找到该组权重目录"，运维看不出是盘没插。
+    （2026-09-26 按 PM 指示补，`pre1/2000` 等归档项不受影响。）
+
+    ⚠ **不声称"受理通过就能跑完"**：推理入口在执行期还有**第三次**解析
+    （`_run_archive_inference`），届时目录若已变化，任务会在执行期失败。这是既有
+    语义，本变更不改变它。
     """
     descriptor = {
         "lead": lead, "year": year, "available": False, "reason": None,
@@ -750,45 +863,88 @@ def resolve_model_group(lead: str, year: int) -> dict:
         descriptor["reason"] = f"lead 格式非法：{lead!r}（应为 preN，如 pre3）"
         return descriptor
 
+    # 只写不覆盖（D8），两个槽：`specific` 收 ①（存在但不完整），`unreach` 收 ②
+    # （根不可用/不可访问）。收尾按 ①＞②＞③ —— 见 docstring 的三档优先级。
+    specific = {"reason": None}
+    unreach = {"reason": None}
+
+    def record_once(message: str) -> None:
+        if specific["reason"] is None:
+            specific["reason"] = message
+
+    def record_root_down(message: str) -> None:
+        if unreach["reason"] is None:
+            unreach["reason"] = message
+
     for root in MODEL_ROOTS:
         directory = Path(root) / lead / str(year)
         # 布局守卫：目录由**已校验的入参**拼成，末两段必须恰为 `{lead}/{year}`，
         # 不递归、不跟随符号链接（否则"这一组的身份"就不可证了）。
         if tuple(directory.parts[-2:]) != (lead, str(year)):
-            descriptor["reason"] = f"模型根布局不符（末两段不是 {lead}/{year}）"
+            record_once(f"模型根布局不符（末两段不是 {lead}/{year}）")
             continue
-        if not directory.is_dir():
-            continue
+        # ⚠ 整个根体都在 `try` 内（D11）：**所有**触碰文件系统的判定 —— 存在性
+        # 探测、取 `mtime` 的 `stat`、`os.scandir` 枚举 —— 共用同一条异常通道。
+        # `pathlib` 的 `is_dir()` 只吞 ENOENT/ENOTDIR/EBADF/ELOOP，权限类
+        # `OSError`（EACCES）会一路冒到端点 ⇒ 整份清单 500 ⇒ 前端落写死的 1 组
+        # 且本会话不重试。注意：**盘符不存在时 `is_dir()` 返回 False 而不抛**，
+        # 所以"指向不存在路径"的夹具永远到不了这个分支 —— 它是另一个分支。
         try:
-            scanned = _scan_group_directory(directory)
+            # 根级探活（2026-09-26 按 PM 指示补）：盘符消失 / 外置盘未挂载 / 根目录被
+            # 改名时，下面那句 `directory.is_dir()` 只返回 `False`（不抛）⇒ 与"这个根上
+            # 确实没有这一组"**同解**，掉盘会伪装成"未找到该组权重目录"，运维看不出是
+            # 盘没插。先探根目录本身，把"根不可用"与"根可用但无此组"分开。
+            if not Path(root).is_dir():
+                record_root_down("模型根不可达（未挂载或根目录不存在）")
+                logger.info("权重组 %s/%s：根 %s 不可达（未挂载或根目录不存在）",
+                            lead, year, root)
+                continue
+            if not directory.is_dir():
+                continue
+            mtime_ns = directory.stat().st_mtime_ns
+            scanned = _scan_group_cached(directory, mtime_ns)
         except OSError as exc:
-            # 外部根掉线 / 权限不足 / 盘符消失。文案**只带异常类名**：
+            # 外部根掉线 / 权限不足。文案**只带异常类名**：
             # `str(OSError)` 通常含绝对路径，而它会进响应（R3）。
-            descriptor["reason"] = f"模型根不可访问（{type(exc).__name__}）"
+            record_root_down(f"模型根不可访问（{type(exc).__name__}）")
+            logger.info("权重组 %s/%s：跳过不可访问的根 %s（%s）",
+                        lead, year, root, type(exc).__name__)
+            continue
+        if scanned["problem"] is not None:
+            # 跳过前**先落因**（D8）：先 continue 再想记录就晚了。
+            record_once(scanned["problem"])
+            logger.info("权重组 %s/%s：跳过不完整的根 %s（%s）",
+                        lead, year, root, scanned["problem"])
             continue
         descriptor.update(directory=directory, files=scanned["files"],
                           bytes=scanned["bytes"], source="dir")
-        descriptor["reason"] = scanned["problem"]
-        descriptor["available"] = scanned["problem"] is None
+        descriptor["available"] = True
         return descriptor
 
-    if descriptor["reason"] is None:
-        descriptor["reason"] = "未找到该组权重目录"
+    descriptor["reason"] = (specific["reason"] or unreach["reason"]
+                            or "未找到该组权重目录")
     return descriptor
 
 
 def list_model_groups() -> list[dict]:
-    """可用组合清单（tasks 1.5 / design D4）：**逐组**调 `resolve_model_group`。
+    """可用组合清单（AC1/AC3）：**逐组**调 `resolve_model_group`，网格恒 400 项。
 
     严禁"先列全部目录再筛"：外部根可能整个不存在，列目录要么先炸要么先慢。
     返回项**不含磁盘路径**；`available` 是唯一权威的可选判据，`files`/`bytes`
     只作展示（实测每组完整权重的这两个值都一样，自己算不出来"可用"）。
+
+    **每个 lead 的 `years` 恒 20 项、绝不为空数组**：消费方 `isValidModelCatalog`
+    是 all-or-nothing，空数组会让整份清单被判非法。`pre1/2000` 的
+    `source="archive"` 由 `resolve_model_group` 的归档短路给出，**此处不写特例**。
+
+    耗时结构（AC6）：每请求只做 400 × 每根 1–2 次**廉价**存在性探测 + 取 `mtime`
+    （`is_dir` 与 `stat` 都不缓存 ⇒ 拔盘/恢复在下一个请求即反映）；昂贵的**内容
+    扫描**走 `_scan_group_cached`。**本函数不因 TTL 而重扫任何一组**。
     """
     catalog = []
-    for lead in GROUP_LEADS + (FROZEN_LEAD,):
-        years = (FROZEN_YEAR,) if lead == FROZEN_LEAD else GROUP_YEARS
+    for lead in GROUP_LEADS:
         items = []
-        for year in years:
+        for year in GROUP_YEARS:
             group = resolve_model_group(lead, year)
             item = {
                 "year": int(year),
@@ -804,6 +960,359 @@ def list_model_groups() -> list[dict]:
             items.append(item)
         catalog.append({"lead": lead, "years": items})
     return catalog
+
+
+# ------------------------------------------------- 扫描缓存 / 落盘清单 / 预热（D5–D7）
+
+# 缓存边界落在"内容扫描"上：定位（`is_dir`）与取 `mtime` 都**免费**
+# （0.0–0.1 ms），内容扫描**贵**（19–29 ms 热 / 数百 ms 冷，实测外置盘冷态下
+# 单组可达数百毫秒）。所以缓存只覆盖后者 —— 这也是"掉盘在下一个请求即反映"
+# 的原因：存在性探测从未被缓存。
+# 值 = `(扫描结论 dict, 本次扫描时刻)`；结论 dict 恒为 `files/bytes/problem`
+# 三键（与 `_scan_group_directory` 逐字段相同）。条目**整体原子发布**（写值即
+# 整条替换），读者不可能看到"半写"的条目。
+_scan_cache: dict[tuple[str, int], tuple[dict, float]] = {}
+_scan_cache_lock = threading.Lock()
+
+
+def _scan_cache_clear() -> int:
+    """清空扫描缓存，返回清掉的条数（诊断/测试用）。"""
+    with _scan_cache_lock:
+        count = len(_scan_cache)
+        _scan_cache.clear()
+    return count
+
+
+def _scan_cache_size() -> int:
+    with _scan_cache_lock:
+        return len(_scan_cache)
+
+
+def _scan_group_cached(directory: Path, mtime_ns: int, *,
+                       force: bool = False) -> dict:
+    """`_scan_group_directory` 的**记忆化**（D5）。键 = `(目录, 目录 mtime_ns)`。
+
+    **锁粒度（C004，必须保持）**：查表持锁 → 未命中**先释放锁**再扫 → 再持锁
+    **整条原子发布**。绝不在持锁期间 `os.scandir`：一次清单请求会 touch 全部
+    400 个键，持锁扫描等于把缓存降级成全局串行锁（冷盘下比不缓存还慢），
+    并把本变更想消灭的延迟原样搬回来。并发下同一组可能被重复扫一次 ——
+    可接受代价，**不得**为省这一次扫描去加长持锁。
+
+    **`stat` 不在这里做**：`mtime_ns` 由调用方（`resolve_model_group`）在它自己
+    那条 `try/except OSError` 内取好传进来。缓存层若自己裸调 `stat`，权限类
+    `OSError` 会绕过 D11 的转换通道，把整份清单打成 500。
+
+    **未命中必须真扫**（AC7）：不得用邻近组结果、上一次结果或任何猜测值代替 ——
+    这直接决定"清单 `available` ⇔ 受理口放行"。命中与未命中的返回值**逐字段相同**。
+
+    `force=True` 只给**请求路径之外**的 TTL 轮次用（`run_scan_round`）：mtime 没变
+    时键相同、否则会命中缓存而不真扫，那样"周期重扫"就成了空转的死参数。
+    """
+    key = (str(directory), int(mtime_ns))
+    if not force:
+        with _scan_cache_lock:
+            hit = _scan_cache.get(key)
+        if hit is not None:
+            return dict(hit[0])           # 浅拷贝：调用方拿不到缓存内的对象
+    scanned = _scan_group_directory(directory)      # ← 锁已释放
+    record = {
+        "files": int(scanned["files"]),
+        "bytes": int(scanned["bytes"]),
+        "problem": scanned["problem"],
+    }
+    with _scan_cache_lock:
+        _scan_cache[key] = (record, time.time())    # 整条原子发布
+    return dict(record)
+
+
+def model_roots_fingerprint() -> str:
+    """当前 `MODEL_ROOTS` 的稳定摘要（**顺序敏感**）。
+
+    落进 manifest 的**文件名**，使两个以不同根列表运行的进程（`8001` fold1 /
+    `8002` foldmax 用 env 覆盖成不同根）各自独立：内容里的指纹只能事后发现
+    "这份不是我的"，文件名指纹则**根本不会写到一起**（不互相覆盖）。
+    用摘要而不是原始路径做文件名 —— 路径含 `:` / `\\` / 中文，不是合法文件名。
+    """
+    joined = "\x00".join(str(p) for p in MODEL_ROOTS)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def model_scan_manifest_path() -> Path:
+    return Path(MODEL_SCAN_MANIFEST_DIR) / (
+        "model_scan_manifest_%s.json" % model_roots_fingerprint()
+    )
+
+
+def write_model_scan_manifest() -> "Path | None":
+    """把当前逐组扫描结论**原子写入**落盘清单（D6）。成功返回路径，失败返回 None。
+
+    条目 schema 固定为五元组 `(组目录, st_mtime_ns, files, bytes, problem)` ——
+    与缓存键同源。**落盘清单不是免检通道**：加载时逐条以当前 `st_mtime_ns` 复核，
+    它受的约束与请求路径的 `mtime` 键完全相同（否则它会变成绕过守卫的第二判据，
+    直接破坏 AC7 的"同一谓词"）。
+
+    **只在请求路径之外调用**（`prewarm_model_groups` / 周期轮次）：请求路径写盘
+    会让每次 `/models` 都落一个文件，也会让测试套件往**真实** `backend/uploads/`
+    写东西（C-4）。
+    """
+    with _scan_cache_lock:
+        snapshot = list(_scan_cache.items())
+    try:
+        path = model_scan_manifest_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "fingerprint": model_roots_fingerprint(),
+            "roots": [str(p) for p in MODEL_ROOTS],
+            "entries": [
+                [key[0], int(key[1]), record["files"], record["bytes"],
+                 record["problem"]]
+                for key, (record, _seen) in snapshot
+            ],
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)               # 原子替换：读者要么看到旧的整份，要么新的整份
+        return path
+    except OSError as exc:
+        logger.warning("落盘扫描清单失败（不影响服务）：%s", exc)
+        return None
+
+
+def load_model_scan_manifest() -> int:
+    """按指纹读取落盘清单并**逐条复核**后填入缓存，返回采纳条数。
+
+    - 路径按**当前**根的指纹取，内容里的指纹与根序列再校一次 ⇒ 不同根列表的
+      结论**根本不会被套用**（不是"事后发现"，而是读不到）。
+    - 每条以**当前** `st_mtime_ns` + `is_dir` 现查：不一致的**单条**丢弃并留待
+      真扫，其余条目照旧复用 —— **一条不一致绝不判整份清单无效**。
+    - 调用时机在启动/请求路径之外（`prewarm_model_groups` 的第一步）。
+    """
+    try:
+        raw = json.loads(model_scan_manifest_path().read_text("utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(raw, dict):
+        return 0
+    if raw.get("fingerprint") != model_roots_fingerprint():
+        return 0
+    if [str(p) for p in MODEL_ROOTS] != list(raw.get("roots") or []):
+        return 0
+    entries = raw.get("entries")
+    if not isinstance(entries, list):
+        return 0
+
+    now = time.time()
+    adopted = 0
+    for item in entries:
+        if not isinstance(item, list) or len(item) != 5:
+            continue
+        directory, mtime_ns, files, total, problem = item
+        try:
+            path = Path(directory)
+            if not path.is_dir():
+                continue
+            if int(path.stat().st_mtime_ns) != int(mtime_ns):
+                continue
+            record = {
+                "files": int(files),
+                "bytes": int(total),
+                "problem": None if problem is None else str(problem),
+            }
+        except (OSError, TypeError, ValueError):
+            continue
+        with _scan_cache_lock:
+            _scan_cache[(str(path), int(mtime_ns))] = (record, now)
+        adopted += 1
+    return adopted
+
+
+def run_scan_round(now: "float | None" = None) -> int:
+    """**请求路径之外**的一轮 TTL 重扫（D5/C006）。返回本轮真正重扫的组数。
+
+    挑出"自上次扫描起超过 `MODEL_SCAN_TTL`"的条目重扫，单轮至多
+    `MODEL_SCAN_BUDGET` 条。**K 为正整数语义**：`K <= 0` 时仍**至少重扫 1 条**
+    （`max(1, K)`）—— "从不重扫"与"只在启动时预热一次"同属死参数，不算满足（C009）。
+
+    ⚠ 这是**唯一**会因 TTL 而重扫的地方。请求路径**不看 TTL**：`list_model_groups()`
+    一次请求就 touch 全部 400 个键，"过期即真扫"会把首次响应延迟从"启动后"搬到
+    "空闲 TTL 后"；而三项守卫只证**形状**、成员被就地改写本就检不出来 ⇒ 收益≈0、
+    代价=周期性全网格真扫（成本收益倒挂，见 design D5）。
+    """
+    ttl = float(MODEL_SCAN_TTL)
+    budget = max(1, int(MODEL_SCAN_BUDGET))
+    stamp = time.time() if now is None else float(now)
+    with _scan_cache_lock:
+        stale = [(key, record) for key, (record, seen) in _scan_cache.items()
+                 if stamp - seen >= ttl]
+    stale.sort(key=lambda pair: pair[0])            # 稳定顺序（先老先扫）
+    rescanned = 0
+    for (path_key, _mtime_ns), _record in stale[:budget]:
+        directory = Path(path_key)
+        try:
+            if not directory.is_dir():
+                continue
+            current = int(directory.stat().st_mtime_ns)
+            _scan_group_cached(directory, current, force=True)   # 真扫并刷新时刻
+        except OSError as exc:
+            logger.info("TTL 重扫跳过不可访问的组 %s（%s）",
+                        path_key, type(exc).__name__)
+            continue
+        rescanned += 1
+    return rescanned
+
+
+# 后台扫描的可观测面（"可中断/可观测"是硬要求，不该只靠日志）。
+_bg_stats = {
+    "rounds": 0, "rescanned": 0, "round_sizes": [], "prewarms": 0,
+    "adopted": 0, "lastScanSeconds": None, "lastAborted": None,
+}
+_prewarm_lock = threading.Lock()
+_bg_thread: "threading.Thread | None" = None
+_bg_stop = threading.Event()
+
+
+def background_scan_stats() -> dict:
+    """后台扫描的可观测面（读快照，不返回内部对象）。"""
+    return {
+        "rounds": _bg_stats["rounds"],
+        "rescanned": _bg_stats["rescanned"],
+        "round_sizes": list(_bg_stats["round_sizes"]),
+        "prewarms": _bg_stats["prewarms"],
+        "adopted": _bg_stats["adopted"],
+        "lastScanSeconds": _bg_stats["lastScanSeconds"],
+        "lastAborted": _bg_stats["lastAborted"],
+        "ttl": float(MODEL_SCAN_TTL),
+        "budget": int(MODEL_SCAN_BUDGET),
+        "prewarm": bool(MODEL_PREWARM),
+    }
+
+
+def active_background_scan_thread() -> "threading.Thread | None":
+    thread = _bg_thread
+    return thread if thread is not None and thread.is_alive() else None
+
+
+def prewarm_model_groups(stop_event=None) -> dict:
+    """遍历候选网格填缓存并刷新落盘清单（D6/D7）。
+
+    顺序：先按指纹读 manifest（能复用就不重扫）→ 逐格解析补漏 → 落盘。
+    **串行**（不并发打同一块外置盘，R10）、**可中断**（`stop_event`，且单组耗时
+    超过 `MODEL_SCAN_STALL_LIMIT` 即中止本轮并记账）、**异常不冒泡**（后台线程里
+    冒泡等于把服务错误面拉进来）。
+    """
+    stop = stop_event if stop_event is not None else _bg_stop
+    started = time.time()
+    adopted = load_model_scan_manifest()
+    scanned = 0
+    aborted = None
+    for lead in GROUP_LEADS:
+        if stop.is_set():
+            aborted = "stop-flag"
+            break
+        for year in GROUP_YEARS:
+            if stop.is_set():
+                aborted = "stop-flag"
+                break
+            mark = time.time()
+            try:
+                resolve_model_group(lead, year)
+            except Exception as exc:        # noqa: BLE001 单组异常不得终止整轮
+                logger.warning("预热单组失败 %s/%s（已跳过）：%s", lead, year, exc)
+                continue
+            scanned += 1
+            spent = time.time() - mark
+            if spent > float(MODEL_SCAN_STALL_LIMIT):
+                # 事后判定（不能抢占阻塞中的系统调用，别称它是硬超时）
+                logger.warning(
+                    "预热单组 %s/%s 耗时 %.1f s 超过保底阈值 %.0f s ⇒ 中止本轮"
+                    "（外置盘掉速/休眠）",
+                    lead, year, spent, float(MODEL_SCAN_STALL_LIMIT),
+                )
+                aborted = "stall"
+                break
+        if aborted is not None:
+            break
+
+    manifest = None if aborted is not None else write_model_scan_manifest()
+    elapsed = time.time() - started
+    _bg_stats["prewarms"] += 1
+    _bg_stats["adopted"] = adopted
+    _bg_stats["lastScanSeconds"] = round(elapsed, 2)
+    _bg_stats["lastAborted"] = aborted
+    logger.info(
+        "权重组预热%s：落盘结论采纳 %d 条，遍历 %d 格，耗时 %.1f s，manifest=%s",
+        "（已中止：%s）" % aborted if aborted else "", adopted, scanned,
+        elapsed, manifest,
+    )
+    return {"adopted": adopted, "scanned": scanned, "seconds": round(elapsed, 2),
+            "aborted": aborted, "manifest": None if manifest is None else str(manifest)}
+
+
+def _background_scan_loop() -> None:
+    """后台执行体：**先预热一轮**，随后按 `MODEL_SCAN_TTL` 间隔跑**周期轮次**。
+
+    周期轮次是 PM 确认的 300 s 兜底**唯一的载体**（C006）：只有"启动时预热一次"
+    的话，启动瞬间刚写入、没有任何条目会"超过 TTL" ⇒ 那个参数会变成**永不生效的
+    死参数**，连"TTL 过期后重扫"这条验收都不可判定。所以轮次必须真的在跑。
+    `MODEL_PREWARM=0` ⇒ 本线程根本不会被创建（预热与周期轮次都没有）。
+    """
+    try:
+        prewarm_model_groups(_bg_stop)
+    except Exception as exc:                # noqa: BLE001 后台线程绝不把错误抛给服务
+        logger.warning("预热异常（已吞，不影响服务）：%s", exc)
+    while not _bg_stop.wait(max(0.05, float(MODEL_SCAN_TTL))):
+        mark = time.time()
+        try:
+            rescanned = run_scan_round()
+        except Exception as exc:            # noqa: BLE001
+            logger.warning("周期重扫异常（已吞）：%s", exc)
+            continue
+        _bg_stats["rounds"] += 1
+        _bg_stats["rescanned"] += rescanned
+        _bg_stats["round_sizes"].append(rescanned)
+        logger.info("权重组周期重扫：本轮 %d 条（预算 K=%s），耗时 %.2f s",
+                    rescanned, MODEL_SCAN_BUDGET, time.time() - mark)
+        try:
+            write_model_scan_manifest()
+        except Exception as exc:            # noqa: BLE001
+            logger.warning("周期落盘清单失败（已吞）：%s", exc)
+
+
+def start_background_model_scan() -> "threading.Thread | None":
+    """启动预热/周期线程并**立即返回**（D7）。已有一条在跑 ⇒ 返回它（单飞）。
+
+    **调用方必须立即返回**：FastAPI 的 `startup` 钩子在服务开始接受连接**之前**
+    完成，内联执行等于把规格里"预热 SHALL NOT 阻断服务启动"直接推翻（C005 ——
+    所援引的先例 `main.py` 的 `verify_dataset_on_startup` 恰是**同步内联**，
+    别照抄它的形态）。`MODEL_PREWARM=0` ⇒ 不起线程。
+
+    ⚠ **调用点只能是服务启动钩子**，绝不能是本模块的导入期：测试套件 `import`
+    就会对外置盘做全网格扫描，而测试会猴补 `MODEL_ROOTS`（D7）。
+    """
+    global _bg_thread
+    if not MODEL_PREWARM:
+        return None
+    with _prewarm_lock:
+        alive = active_background_scan_thread()
+        if alive is not None:
+            return alive                    # 单飞：同一时刻只有一个预热在跑
+        _bg_stop.clear()
+        thread = threading.Thread(target=_background_scan_loop,
+                                  name="model-scan-prewarm", daemon=True)
+        _bg_thread = thread
+        thread.start()
+    logger.info("权重组后台扫描线程已启动（MODEL_SCAN_TTL=%ss，预算 K=%s）",
+                MODEL_SCAN_TTL, MODEL_SCAN_BUDGET)
+    return thread
+
+
+def stop_background_model_scan(timeout: float = 5.0) -> bool:
+    """请求停止后台扫描并等待收工（测试/优雅关停用）。返回是否已停下。"""
+    _bg_stop.set()
+    thread = _bg_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=timeout)
+    return not (thread is not None and thread.is_alive())
 
 
 # ------------------------------------------------- 权重组加载（两条分支共用循环）

@@ -82,6 +82,27 @@ def verify_dataset_on_startup():
         logger.warning("... 其余 %d 个缺失文件省略", len(missing) - 10)
 
 
+@app.on_event("startup")
+def start_model_scan_on_startup():
+    """启动时**异步**拉起权重组后台扫描（预热 + 周期重扫），**立即返回**。
+
+    ⚠ 不得内联执行、不得 `await`（design D7 / 对抗审查 C005）：FastAPI 的 startup
+    钩子在服务**开始接受连接之前**完成，等预热跑完再返回等于把规格里「预热 SHALL
+    NOT 阻断服务启动」直接推翻 —— 400 组、且打的是外置盘，冷态可达数百秒。
+    **不要**照抄上面 `verify_dataset_on_startup` 的同步内联形态：它扫的是仓库内的
+    小目录（秒级），形态对但代价完全不同。
+
+    `MODEL_PREWARM=0` ⇒ `start_background_model_scan()` 返回 None、不起线程；
+    这会**连带关掉周期重扫**（TTL 兜底随之不生效），见 `两站点运行手册.md`。
+    """
+    from live_prediction import start_background_model_scan
+    thread = start_background_model_scan()
+    if thread is None:
+        logger.info("权重组后台扫描已关闭（MODEL_PREWARM=0）：本次不预热")
+    else:
+        logger.info("权重组后台扫描线程已启动：%s（预热不阻断启动）", thread.name)
+
+
 def parse_lead(lead: str) -> int:
     """解析 lead 参数（'pre6' → 6），严格校验 pre1~pre20（拒绝前导零如 pre01）。"""
     if not isinstance(lead, str) or len(lead) > 5:
