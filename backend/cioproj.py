@@ -206,12 +206,26 @@ def lat_highpass(U3: np.ndarray) -> np.ndarray:
     return sosfiltfilt(sos, U3, axis=0)
 
 
-def project_u850(U3: np.ndarray, dom: np.ndarray, consts: dict) -> np.ndarray:
-    """(41,81,T) 原始场 → 一维投影序列 (T,)。"""
+def project_u850(U3: np.ndarray, dom: np.ndarray, consts: dict,
+                 diagnostic_indices=None):
+    """(41,81,T) 原始场 → 一维投影序列；按需返回指定日期的中间场。"""
     remain = U3 - dom_average(U3, dom) - lat_highpass(U3)
     X = (remain - consts["Umean"]) / consts["Ustd"]
     M = X.reshape(NLAT * NLON, X.shape[2], order="F")                      # 纬度快变
-    return consts["e_u850"] @ M
+    series = consts["e_u850"] @ M
+    if diagnostic_indices is None:
+        return series
+
+    indices = np.asarray(diagnostic_indices, dtype=int)
+    weights = consts["e_u850"].reshape(NLAT, NLON, order="F")
+    return series, {
+        # 这些数组要与 `series` 使用同一条 float64 数值边界：它们不仅用于
+        # 展示，也用于逐格点贡献与 CIO 闭合诊断。这里若先降为 float32，后续
+        # 即使再转回 float64 也无法恢复舍入前的投影值。
+        "raw": np.asarray(U3[:, :, indices], dtype=np.float64),
+        "processed": np.asarray(X[:, :, indices], dtype=np.float64),
+        "weights": np.asarray(weights, dtype=np.float64),
+    }
 
 
 # ----------------------------------------------------------------- 分派入口
@@ -233,7 +247,8 @@ def detect_kind(name: str, array=None) -> str:
 
 
 def compute_cioproj(which: str = "u850", nc_dir: str = None, years=(),
-                    lead: int = 1, mat_path: str = None, name: str = ""):
+                    lead: int = 1, mat_path: str = None, name: str = "",
+                    diagnostic_year: int = None):
     """原始场 → projected CIO 序列。
 
     which: "u850" | "sst" | "both" | "auto"
@@ -256,7 +271,18 @@ def compute_cioproj(which: str = "u850", nc_dir: str = None, years=(),
     years = list(years)
     U3, dom, rows, missing = load_field(nc_dir, years, lead)
     consts = load_consts(mat_path)
-    series = project_u850(U3, dom, consts)
+    diagnostic_indices = None
+    if diagnostic_year is not None:
+        diagnostic_indices = [
+            index for index, row in enumerate(rows) if row[0] == diagnostic_year
+        ]
+        if not diagnostic_indices:
+            raise ValueError("诊断年份 %d 不在 U850 序列中" % diagnostic_year)
+    projected = project_u850(U3, dom, consts, diagnostic_indices)
+    if diagnostic_indices is None:
+        series = projected
+    else:
+        series, projection_diagnostics = projected
     per_year = {}
     for (y, _mo, _d) in rows:
         per_year[y] = per_year.get(y, 0) + 1
@@ -264,6 +290,10 @@ def compute_cioproj(which: str = "u850", nc_dir: str = None, years=(),
     meta = {"which": "u850", "lead": lead, "years": years,
             "length": int(series.size), "days_per_year": per_year,
             "missing_months": missing, "window": window(lead), "dates": dates}
+    if diagnostic_indices is not None:
+        projection_diagnostics["dates"] = [dates[index] for index in diagnostic_indices]
+        projection_diagnostics["projected"] = series[diagnostic_indices]
+        meta["projection_diagnostics"] = projection_diagnostics
     if missing:
         meta["warning"] = ("缺这些月份的源文件 %s —— 窗口天数不足 112/年，"
                            "与官方序列会有偏差" % missing)

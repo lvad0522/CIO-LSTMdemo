@@ -139,6 +139,135 @@ def _normalized_path(job_dir: Path) -> Path:
     return job_dir / "normalized_window.npy"
 
 
+def _projection_preview_path(job_dir: Path) -> Path:
+    return job_dir / "projection_preview.npz"
+
+
+# `projection_preview.npz` 是阶段①诊断专用的小窗口，不是整段 CIO 序列。
+# 在这里把长度写死为契约值，避免某处意外拿到了多年的三维场却仍被前端当成
+# "目标年 112 点"展示。
+_PROJECTION_PREVIEW_STEPS = 112
+_PROJECTION_PREVIEW_CLOSURE_TOLERANCE = 2e-4
+
+
+class _ProjectionPreviewValidationError(ValueError):
+    """落盘投影过程对照违反其可展示的数值契约。"""
+
+
+def _validate_projection_preview(
+    raw: object,
+    processed: object,
+    weights: object,
+    dates: object,
+    projected: object,
+) -> dict:
+    """转为 float64 并校验 `projection_preview.npz` 的完整数值契约。
+
+    这条检查同时被阶段①落盘和只读 API 使用：前者不写入天数/闭合已经失真的
+    诊断产物，后者把旧任务被手动损坏或不完整的产物转成明确 500，而不是返回
+    形状错位、半截日期或全零替代图。
+    """
+    try:
+        raw_all = np.asarray(raw, dtype=np.float64)
+        processed_all = np.asarray(processed, dtype=np.float64)
+        weights_all = np.asarray(weights, dtype=np.float64)
+        dates_all = np.asarray(dates)
+        projected_all = np.asarray(projected, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _ProjectionPreviewValidationError(
+            "投影过程产物包含无法转换的数值数组"
+        ) from exc
+
+    expected_spatial = (cioproj.NLAT, cioproj.NLON)
+    expected_field_shape = expected_spatial + (_PROJECTION_PREVIEW_STEPS,)
+    if raw_all.shape != expected_field_shape:
+        raise _ProjectionPreviewValidationError(
+            "投影过程产物的 raw 必须是 41×81×112"
+        )
+    if processed_all.shape != expected_field_shape:
+        raise _ProjectionPreviewValidationError(
+            "投影过程产物的 processed 必须是 41×81×112"
+        )
+    if weights_all.shape != expected_spatial:
+        raise _ProjectionPreviewValidationError(
+            "投影过程产物的 weights 必须是 41×81"
+        )
+    if dates_all.ndim != 1 or dates_all.size != _PROJECTION_PREVIEW_STEPS:
+        raise _ProjectionPreviewValidationError(
+            "投影过程产物的 dates 必须与 112 点时间轴等长"
+        )
+    if projected_all.ndim != 1 or projected_all.size != _PROJECTION_PREVIEW_STEPS:
+        raise _ProjectionPreviewValidationError(
+            "投影过程产物的 projected 必须与 112 点时间轴等长"
+        )
+
+    for name, values in (
+        ("raw", raw_all),
+        ("processed", processed_all),
+        ("weights", weights_all),
+        ("projected", projected_all),
+    ):
+        if not np.isfinite(values).all():
+            raise _ProjectionPreviewValidationError(
+                f"投影过程产物的 {name} 包含 NaN 或 Inf"
+            )
+
+    # 必须和后续单日统计采用同一 float64 数值边界；不做陆海掩膜或平滑。
+    with np.errstate(over="ignore", invalid="ignore"):
+        contribution_all = processed_all * weights_all[:, :, None]
+    if not np.isfinite(contribution_all).all():
+        raise _ProjectionPreviewValidationError(
+            "投影过程产物的格点贡献包含 NaN 或 Inf"
+        )
+    net_all = np.sum(contribution_all, axis=(0, 1), dtype=np.float64)
+    closure_all = net_all - projected_all
+    max_closure_error = float(np.max(np.abs(closure_all)))
+    if max_closure_error > _PROJECTION_PREVIEW_CLOSURE_TOLERANCE:
+        raise _ProjectionPreviewValidationError(
+            "投影过程产物的全窗口闭合误差 %.6g 超过 %.6g"
+            % (max_closure_error, _PROJECTION_PREVIEW_CLOSURE_TOLERANCE)
+        )
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        average_abs = np.mean(np.abs(contribution_all), axis=2, dtype=np.float64)
+    if not np.isfinite(average_abs).all():
+        raise _ProjectionPreviewValidationError(
+            "投影过程产物的格点贡献包含 NaN 或 Inf"
+        )
+    return {
+        "raw": raw_all,
+        "processed": processed_all,
+        "weights": weights_all,
+        "dates": dates_all,
+        "projected": projected_all,
+        "contribution": contribution_all,
+        "net": net_all,
+        "closure": closure_all,
+        "averageAbs": average_abs,
+        "maxClosureError": max_closure_error,
+    }
+
+
+def _read_projection_preview(path: Path) -> dict:
+    """读取并验证诊断产物；供路由映射为不含内部路径的 HTTP 错误。"""
+    try:
+        with np.load(path, allow_pickle=False) as artifact:
+            return _validate_projection_preview(
+                artifact["raw"],
+                artifact["processed"],
+                artifact["weights"],
+                artifact["dates"],
+                artifact["projected"],
+            )
+    except _ProjectionPreviewValidationError:
+        raise
+    except (KeyError, OSError, ValueError, EOFError, TypeError,
+            zipfile.BadZipFile) as exc:
+        raise _ProjectionPreviewValidationError(
+            "投影过程产物损坏或缺少必要字段"
+        ) from exc
+
+
 def _dates_path(job_dir: Path) -> Path:
     return job_dir / "dates.json"
 
@@ -414,13 +543,34 @@ def _run_zip_stage1(job_id: str, job_dir: Path, projection: dict, lead: int,
         lead=lead,
         mat_path=str(prediction._mat_path()),
         name=filename,
+        diagnostic_year=projection["year"],
     )
     dates = meta.get("dates")
     if dates is None:                       # 不吞日期索引：谱与参考线都靠它
         raise RuntimeError("投影结果缺少日期索引（dates）")
-
+    preview = meta.pop("projection_diagnostics", None)
+    if preview is None:
+        raise RuntimeError("投影结果缺少 U850 过程对照产物")
+    try:
+        preview_data = _validate_projection_preview(
+            preview["raw"],
+            preview["processed"],
+            preview["weights"],
+            preview["dates"],
+            preview["projected"],
+        )
+    except (KeyError, _ProjectionPreviewValidationError) as exc:
+        raise RuntimeError("投影过程对照产物无效：%s" % exc) from exc
     series = np.asarray(series, dtype=np.float64)
     np.save(_series_path(job_dir), series, allow_pickle=False)
+    np.savez_compressed(
+        _projection_preview_path(job_dir),
+        raw=preview_data["raw"],
+        processed=preview_data["processed"],
+        weights=preview_data["weights"],
+        dates=preview_data["dates"],
+        projected=preview_data["projected"],
+    )
     diagnostics._write_json(_dates_path(job_dir), dates)
     diagnostics._write_json(
         _completeness_path(job_dir), diagnostics._zip_completeness(meta)
