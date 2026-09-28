@@ -1,4 +1,4 @@
-import { Fragment, useState, useCallback } from 'react';
+import { Fragment, useState, useCallback, useEffect, useRef } from 'react';
 import DataSelector from './components/DataSelector';
 import ModuleSelector from './components/ModuleSelector';
 import ParamPanel from './components/ParamPanel';
@@ -14,6 +14,29 @@ import './App.css';
 
 // 开发期默认走 Vite 同源代理；第二套后端仍可用 VITE_API_BASE 覆盖。
 const API_BASE = import.meta.env.VITE_API_BASE || '';
+
+const FALLBACK_MODEL_CATALOG = {
+  leads: [{
+    lead: 'pre1',
+    years: [{ year: 2000, available: true, files: 0, bytes: 0, source: 'archive' }],
+  }],
+};
+
+function isValidModelCatalog(data) {
+  return Boolean(
+    data
+    && Array.isArray(data.leads)
+    && data.leads.length > 0
+    && data.leads.every(item => (
+      typeof item?.lead === 'string'
+      && Array.isArray(item.years)
+      && item.years.length > 0
+      && item.years.every(year => (
+        Number.isFinite(Number(year?.year)) && typeof year?.available === 'boolean'
+      ))
+    )),
+  );
+}
 
 const defaultParams = {
   cioFilterLow: 0.02,
@@ -31,7 +54,7 @@ const STAGE_NORMALIZATION = 2;
 const STAGE_PREDICTION = 3;
 const STAGE_STEPS = [
   { n: STAGE_PROJECTION, label: '投影CIO' },
-  { n: STAGE_NORMALIZATION, label: '归一化窗口' },
+  { n: STAGE_NORMALIZATION, label: '准备模型输入' },
   { n: STAGE_PREDICTION, label: 'LSTM降水' },
 ];
 
@@ -46,9 +69,64 @@ export default function App() {
   // 显示顺序统一为 (经度, 纬度) = (j, i)：横轴=经度、纵轴=纬度（2026-08-25）
   const [selectedGrid, setSelectedGrid] = useState({ i: 40, j: 50 });
   const [cioFile, setCioFile] = useState(null);
-  const [uploadKind, setUploadKind] = useState('npy');  // 'npy'（CIO 序列）| 'zip'（原始气象场）
+  // 2026-09-21：默认值由 'npy' 改为 'zip' —— 上传区的「CIO 序列 (.npy)」tab 已注释掉
+  // （见 DataSelector.jsx 的 UPLOAD_KINDS）。默认值若仍为 'npy'，就没有任何 tab 处于
+  // 激活态、且拖拽区会显示「拖拽 CIO .npy 到此处」。'npy' 分支的代码全部保留。
+  const [uploadKind, setUploadKind] = useState('zip');  // 'zip'（原始气象场）| 'npy'（CIO 序列，入口已注释）
+  // 上传模式的权重组合与默认展示链参数隔离，避免污染 /api/run 与 /api/grid。
+  const [uploadYear, setUploadYear] = useState(2000);
+  const [uploadLead, setUploadLead] = useState('pre1');
+  const [modelCatalog, setModelCatalog] = useState(null);
+  const [modelCatalogError, setModelCatalogError] = useState(false);
+  const [modelCatalogLoading, setModelCatalogLoading] = useState(false);
+  const modelCatalogRequestRef = useRef(false);
   // 整条链只有一个任务状态、一次轮询（design D11：上传模式不再有 cioJob/predictionJob）
   const [chainJob, setChainJob] = useState(null);
+
+  const uploadMode = dataSource === 'upload';
+
+  useEffect(() => {
+    if (!uploadMode || modelCatalogRequestRef.current) return undefined;
+    modelCatalogRequestRef.current = true;
+    setModelCatalogLoading(true);
+    fetch(`${API_BASE}/api/chain/models`)
+      .then(async response => {
+        const data = await response.json().catch(() => null);
+        if (!response.ok || !isValidModelCatalog(data)) {
+          throw new Error('模型组合清单读取失败');
+        }
+        return data;
+      })
+      .then(data => {
+        setModelCatalog(data);
+        setModelCatalogError(false);
+        const groups = data.leads.flatMap(item => (
+          (item.years || []).map(year => ({ lead: item.lead, ...year }))
+        ));
+        const selected = groups.find(group => (
+          group.lead === uploadLead
+          && Number(group.year) === Number(uploadYear)
+          && group.available
+        ));
+        if (!selected) {
+          const fallback = groups.find(group => (
+            group.lead === 'pre1' && Number(group.year) === 2000 && group.available
+          )) || groups.find(group => group.available);
+          if (fallback) {
+            setUploadLead(fallback.lead);
+            setUploadYear(Number(fallback.year));
+          }
+        }
+      })
+      .catch(() => {
+        setModelCatalog(null);
+        setModelCatalogError(true);
+      })
+      .finally(() => {
+        setModelCatalogLoading(false);
+      });
+    return undefined;
+  }, [uploadMode, uploadLead, uploadYear]);
 
   const handleParamChange = useCallback((key, value) => {
     setParams(prev => ({ ...prev, [key]: value }));
@@ -60,9 +138,23 @@ export default function App() {
     setChainJob(null);
     setError(null);
     if (nextSource === 'upload') {
-      setParams(prev => ({ ...prev, predYear: 2000, leadTime: 'pre1' }));
+      setUploadYear(2000);
+      setUploadLead('pre1');
     }
   }, []);
+
+  const handleUploadLeadChange = useCallback((event) => {
+    const nextLead = event.target.value;
+    setUploadLead(nextLead);
+    const catalog = modelCatalog || FALLBACK_MODEL_CATALOG;
+    const lead = catalog.leads.find(item => item.lead === nextLead);
+    const currentYear = lead?.years?.find(item => (
+      Number(item.year) === Number(uploadYear) && item.available
+    ));
+    if (currentYear) return;
+    const firstAvailable = lead?.years?.find(item => item.available);
+    if (firstAvailable) setUploadYear(Number(firstAvailable.year));
+  }, [modelCatalog, uploadYear]);
 
   const handleCioFileChange = useCallback((file, detectedKind) => {
     setCioFile(file);
@@ -103,8 +195,8 @@ export default function App() {
         const form = new FormData();
         form.append('file', cioFile);
         const query = new URLSearchParams({
-          year: '2000',
-          lead: 'pre1',
+          year: String(uploadYear),
+          lead: uploadLead,
           which: uploadKind === 'zip' ? 'u850' : 'cio',
         });
         if (runScope === 'projection') query.set('onlyProjection', 'true');
@@ -151,7 +243,7 @@ export default function App() {
     } finally {
       setRunning(false);
     }
-  }, [params, dataSource, cioFile, uploadKind, runScope]);
+  }, [params, dataSource, cioFile, uploadKind, runScope, uploadYear, uploadLead]);
 
   const handleGridClick = useCallback(async (i, j, region) => {
     setSelectedGrid({ i, j });
@@ -170,7 +262,6 @@ export default function App() {
     }
   }, [params.predYear, params.leadTime]);
 
-  const uploadMode = dataSource === 'upload';
   const stageIndex = Number(chainJob?.stageIndex ?? 0);
   const stageStatus = chainJob?.status;
   const stageInFlight = stageStatus === 'running' || stageStatus === 'queued' || stageStatus === 'uploading';
@@ -218,6 +309,13 @@ export default function App() {
           params={params}
           onChange={handleParamChange}
           liveModelMode={uploadMode}
+          uploadYear={uploadYear}
+          uploadLead={uploadLead}
+          onUploadYearChange={event => setUploadYear(Number(event.target.value))}
+          onUploadLeadChange={handleUploadLeadChange}
+          modelCatalog={modelCatalog || FALLBACK_MODEL_CATALOG}
+          modelCatalogError={modelCatalogError}
+          modelCatalogLoading={modelCatalogLoading}
         />
 
         <RunButton
@@ -234,7 +332,7 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="main-content">
+      <main className="main-content" aria-busy={running}>
         {error && (
           <div className="error-banner">
             <span>⚠️ {error}</span>
@@ -279,7 +377,7 @@ export default function App() {
             <h2>上传一次即可跑完整条链</h2>
             <p>
               选择 .zip（原始 U850 气象场）或 .npy（已投影 CIO 序列）→ 点击“运行” →
-              投影 CIO → 归一化窗口 → LSTM 降水推理 由上到下依次解锁，中途不需要重新选文件。
+              投影 CIO → 准备模型输入 → LSTM 降水推理由上到下依次解锁，中途不需要重新选文件。
             </p>
           </div>
         )}
@@ -294,7 +392,7 @@ export default function App() {
 
         {uploadMode && stageIndex >= STAGE_NORMALIZATION && (
           <section className="chain-stage-group">
-            <h2 className="chain-stage-heading">阶段② 归一化窗口</h2>
+            <h2 className="chain-stage-heading">阶段② 准备 LSTM 输入</h2>
             <NormalizationPanel job={chainJob} />
           </section>
         )}

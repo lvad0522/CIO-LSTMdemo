@@ -1,7 +1,11 @@
 import NpyUploader from './NpyUploader';
 
+// 2026-09-21 PM 决定：注释掉「CIO 序列 (.npy)」入口 —— 标准CIO 投影基（.mat）
+// 由后端本地调用，用户只需上传原始气象场，无需自带 CIO 序列。
+// 恢复方式：取消下一行注释并把 App.jsx 的 uploadKind 默认值改回 'npy'
+//（NpyUploader 与 handleCioFileChange 的 .npy 分支都还在，未删）。
 const UPLOAD_KINDS = [
-  { value: 'npy', label: 'CIO 序列 (.npy)' },
+  // { value: 'npy', label: 'CIO 序列 (.npy)' },
   { value: 'zip', label: '原始气象场 (.zip)' },
 ];
 

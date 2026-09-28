@@ -1,7 +1,7 @@
-// 阶段② 归一化窗口：把"② 落盘的那一份"直接画出来。
+// 阶段② LSTM 输入：把"② 落盘的那一份"直接画出来。
 // 它**自己**去 /api/chain/jobs/{id}/series 取 normalizedWindow（design D12），
 // 不复用① 的取数结果 —— 面板上看到的与阶段③ 读盘喂模型的是同一个端点字段。
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import {
   CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
@@ -9,11 +9,10 @@ import {
 const API_BASE = import.meta.env.VITE_API_BASE || '';
 
 const MODE_LABELS = {
-  'training-equivalent': '训练同口径：截取前 2240 点后整段 min-max',
+  'training-equivalent': '训练同口径：前 2240 点统一确定 min-max 范围',
   partial: '短序列：按现有长度整段 min-max（尺度与训练不完全一致）',
+  'extended-base': '为覆盖目标年扩大了 min-max 基准（与训练口径存在偏差）',
 };
-
-const TRAIN_SEQ_LEN = 2240;
 
 function formatValue(value) {
   return Number.isFinite(value) ? value.toFixed(4) : '—';
@@ -42,34 +41,61 @@ export default function NormalizationPanel({ job }) {
   }, [job?.jobId]);
 
   const chartData = (window_ || []).map((value, index) => ({ index: index + 1, value }));
-  // 截断口径写成"截前 2240"只在真的截过时才对：短序列是整段自归一
-  const truncated = Number(normalization.usedLength) === TRAIN_SEQ_LEN
-    && Number(normalization.inputLength) > TRAIN_SEQ_LEN;
-
-  const summary = [
-    `输入 ${normalization.inputLength ?? '—'} 点`,
-    truncated ? `截前 ${TRAIN_SEQ_LEN}` : `整段 ${normalization.usedLength ?? '—'} 点`,
-    `min-max[${formatValue(normalization.cioMin)}, ${formatValue(normalization.cioMax)}]`,
-    selectedRange.length === 2 ? `取第 ${selectedRange[0] + 1}–${selectedRange[1]} 点` : null,
-  ].filter(Boolean).join(' → ');
+  const usedLength = normalization.usedLength ?? '—';
+  const targetYear = normalization.targetYear ?? job?.projection?.year;
+  const flow = [
+    {
+      label: '投影 CIO',
+      value: `${normalization.inputLength ?? '—'} 点`,
+      note: '阶段①得到的完整时间序列',
+    },
+    {
+      label: '确定统一缩放范围',
+      value: `${usedLength} 点`,
+      note: `最小值 ${formatValue(normalization.cioMin)}，最大值 ${formatValue(normalization.cioMax)}`,
+    },
+    {
+      label: targetYear ? `取 ${targetYear} 年` : '取目标年',
+      value: selectedRange.length === 2
+        ? `第 ${selectedRange[0] + 1}–${selectedRange[1]} 点`
+        : '112 点',
+      note: '每天缩放到 0–1',
+    },
+    {
+      label: '送入 LSTM',
+      value: `${chartData.length || 112} 天`,
+      note: '阶段③实际读取的输入张量',
+    },
+  ];
 
   return (
     <div className="result-card normalization-panel">
       <div className="result-header">
         <div>
-          <h3 className="result-title" style={{ margin: 0 }}>归一化窗口</h3>
+          <h3 className="result-title" style={{ margin: 0 }}>LSTM 实际输入（112天）</h3>
           <p className="metric-note" style={{ margin: '6px 0 0' }}>
-            这一份就是阶段③ 从磁盘读走的张量；界面上看到的与喂进模型的是同一个文件。
+            CIO 原值大小没有统一量纲，先按训练时的规则缩放到 0–1，再截取目标年送入模型。
           </p>
         </div>
         <span className="region-badge">{normalization.mode || '—'}</span>
       </div>
 
-      <div className="normalization-summary">{summary || '正在读取归一化摘要…'}</div>
+      <div className="normalization-flow" aria-label="准备 LSTM 输入流程">
+        {flow.map((step, index) => (
+          <Fragment key={step.label}>
+            <div className="normalization-step">
+              <span>{step.label}</span>
+              <strong>{step.value}</strong>
+              <small>{step.note}</small>
+            </div>
+            {index < flow.length - 1 && <span className="normalization-arrow" aria-hidden="true">→</span>}
+          </Fragment>
+        ))}
+      </div>
       <p className="metric-note">
         {MODE_LABELS[normalization.mode] || '正在读取归一化口径'}
       </p>
-      {normalization.warning && <p className="smoke-warning">⚠️ {normalization.warning}</p>}
+      {normalization.warning && <p className="smoke-warning">{normalization.warning}</p>}
       {error && <div className="error-banner">{error}</div>}
 
       {chartData.length ? (
@@ -79,9 +105,13 @@ export default function NormalizationPanel({ job }) {
             <XAxis
               dataKey="index"
               minTickGap={24}
-              label={{ value: '窗口内第几天', position: 'insideBottom', offset: -12 }}
+              label={{ value: '目标年输入的第几天', position: 'insideBottom', offset: -12 }}
             />
-            <YAxis width={54} domain={[0, 1]} />
+            <YAxis
+              width={58}
+              domain={[0, 1]}
+              label={{ value: '缩放后的 CIO', angle: -90, position: 'insideLeft' }}
+            />
             <Tooltip
               labelFormatter={value => `第 ${value} 天`}
               formatter={value => [Number(value).toFixed(4), '归一化值']}
@@ -92,7 +122,7 @@ export default function NormalizationPanel({ job }) {
               stroke="#3b8734"
               dot={false}
               strokeWidth={1.5}
-              name="喂进模型的 112 点"
+              name="LSTM 实际输入"
             />
           </LineChart>
         </ResponsiveContainer>
