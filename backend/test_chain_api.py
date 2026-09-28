@@ -622,27 +622,55 @@ try:
     check(default_params_job["status"] == "completed",
           "默认参数的链路任务跑完", default_params_job.get("error"))
 
-    for params, want, label in (
-            ({"year": 2001, "lead": "pre1"}, "pre1/2001", "year=2001"),
-            ({"year": 2000, "lead": "pre2"}, "pre2/2000", "lead=pre2"),
-            ({"year": 2001, "lead": "pre1", "onlyProjection": "true"},
-             "pre1/2001", "year=2001 + onlyProjection（不放宽）"),
-            ({"year": 2000, "lead": "pre2", "onlyProjection": "true"},
-             "pre2/2000", "lead=pre2 + onlyProjection（不放宽）")):
-        r = client.post("/api/chain/jobs", params=params,
-                        files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
-        # 口径改了（import-all-models §4.1/§4.2）：不再是"唯一规则表"那句，
-        # 而是查可用性 —— 文案含组合标识与原因，且与"格式非法"分开。
-        check(r.status_code == 400 and want in r.text
-              and "格式" not in r.text,
-              "400：%s（组合不可用文案）" % label,
-              "%s %s" % (r.status_code, r.text[:160]))
+    # 组合不可用的**真前提**用**猴补 MODEL_ROOTS 指向不存在根**构造，不写死
+    # "某个组合反正没有"：盘面一变那种写法就是假绿（实测 `E:/pre3/2011` 是**有**的，
+    # 旧的 `_UNAVAIL=("pre3",2011)` 正是这么失效的）。也**不**改用"网格外年份
+    # （如 2020）"—— 那种输入在**入参校验**阶段就被拒，根本走不到可用性谓词。
+    # 同一段猴补里再问一次**归档组合**：**同样的根**下 pre1/2000 仍放行 ⇒ 这些 400
+    # 确实来自可用性谓词，而不是"什么都 400"（同根分辨器）。
+    _real_roots = lp.MODEL_ROOTS
+    lp.MODEL_ROOTS = [TMP_BASE / "_no_such_model_root"]
+    # "被拒不留目录"按**性质**断言（集合相等），不数写死的个数。集合相等本身有
+    # "两边都空"的恒真风险 ⇒ 配正向对照：本段确实受理过任务（`_dirs_before` 非空）。
+    _dirs_before = set(p.name for p in JOB_ROOT.iterdir())
+    try:
+        for params, want, label in (
+                ({"year": 2001, "lead": "pre1"}, "pre1/2001", "year=2001"),
+                ({"year": 2000, "lead": "pre2"}, "pre2/2000", "lead=pre2"),
+                ({"year": 2001, "lead": "pre1", "onlyProjection": "true"},
+                 "pre1/2001", "year=2001 + onlyProjection（不放宽）"),
+                ({"year": 2000, "lead": "pre2", "onlyProjection": "true"},
+                 "pre2/2000", "lead=pre2 + onlyProjection（不放宽）")):
+            r = client.post("/api/chain/jobs", params=params,
+                            files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+            # 口径（import-all-models §4.1/§4.2）：查可用性 —— 文案含组合标识与原因，
+            # 且与"格式非法"分开。**原因文案从谓词派生**（受理口 ⇔ 谓词交叉验证），
+            # 不写死字符串：写死的话谓词换了文案这条就变成假红/假绿。
+            _wp_lead, _wp_year = want.split("/")
+            _want_reason = lp.resolve_model_group(_wp_lead, int(_wp_year))["reason"]
+            _detail = r.json().get("detail", "") if r.status_code == 400 else r.text
+            check(r.status_code == 400 and want in _detail
+                  and bool(_want_reason) and _want_reason in _detail
+                  and "格式" not in _detail,
+                  "400：%s（组合不可用文案）" % label,
+                  "%s %s || 派生原因=%r" % (r.status_code, r.text[:160],
+                                            _want_reason))
+        _arch_ok, _arch_msg = True, None
+        try:
+            ch._require_available("pre1", 2000)
+        except Exception as _exc_arch:        # noqa: BLE001
+            _arch_ok, _arch_msg = False, repr(_exc_arch)
+        check(_arch_ok,
+              "同样的猴补根下 pre1/2000（归档短路）仍放行 —— 400 源自可用性谓词",
+              _arch_msg)
+    finally:
+        lp.MODEL_ROOTS = _real_roots
 
-    # 被拒的任务不留目录：A1 zip 全链 + A2 npy 全链 + A3 只跑投影 + 缺月 zip
-    # + 无参数 = 5
-    leftovers = sorted(p.name for p in JOB_ROOT.iterdir())
-    check(len(leftovers) == 5, "五次成功受理 = 5 个目录，被拒的都不留店",
-          leftovers)
+    # 被拒的请求不留目录：按**性质**断言（集合相等），不数个数
+    _dirs_after = set(p.name for p in JOB_ROOT.iterdir())
+    check(_dirs_after == _dirs_before and len(_dirs_before) >= 1,
+          "被拒的请求不留任务目录（集合相等；正向对照：本段确实受理过任务）",
+          (len(_dirs_before), sorted(_dirs_after - _dirs_before)))
 
     # ================== A7. 权重组清单与放开受理（import-all-models，AC1/AC3/AC4）
     #
@@ -657,16 +685,26 @@ try:
     catalog = r.json()
     check_no_leak(catalog, "清单响应里没有任何磁盘路径（递归扫描）")
     _leads = {item["lead"]: item for item in catalog.get("leads", [])}
-    check(sorted(_leads) == ["pre1", "pre10", "pre15", "pre3", "pre5"],
-          "清单覆盖 4 个 lead + 冻结归档 pre1", sorted(_leads))
-    _GRID_YEARS = [2000, 2002, 2003, 2005, 2007, 2008, 2009, 2010, 2012]
-    for _lead in ("pre3", "pre5", "pre10", "pre15"):
-        check([y["year"] for y in _leads[_lead]["years"]] == _GRID_YEARS,
-              "%s 列出 9 个候选年" % _lead,
-              [y["year"] for y in _leads[_lead]["years"]])
-    _p1 = _leads["pre1"]["years"]
-    check([y["year"] for y in _p1] == [2000] and _p1[0]["source"] == "archive",
-          "pre1 只有冻结归档 2000（source=archive）", _p1)
+    # 期望值**从规格区间派生**（pre1..pre20 / 2000..2019），不写死组名或年份清单
+    # （`import-all-models` 时代写死的 4 lead × 9 年已随 400 组网格失效）；再与模块的
+    # **声明式网格常量**交叉验证一次 —— 两边不一致就是网格常量自己漂了。
+    _want_leads = {"pre%d" % n for n in range(1, 21)}
+    _want_years = list(range(2000, 2020))
+    check(set(_leads) == _want_leads and set(_leads) == set(lp.GROUP_LEADS),
+          "清单覆盖全部 20 个 lead == 规格区间 pre1..pre20（与声明式网格一致）",
+          (sorted(_leads), sorted(set(_leads) ^ _want_leads)))
+    check(list(lp.GROUP_YEARS) == _want_years,
+          "声明式网格 GROUP_YEARS == 规格区间 2000..2019", list(lp.GROUP_YEARS))
+    _bad_years = [(l, [y["year"] for y in _leads[l]["years"]])
+                  for l in _leads
+                  if [y["year"] for y in _leads[l]["years"]] != _want_years]
+    check(not _bad_years,
+          "每个 lead 的 years == 2000..2019 且恒 20 项（非空；前端 all-or-nothing）",
+          _bad_years[:2])
+    _p1 = {y["year"]: y for y in _leads["pre1"]["years"]}
+    check(_p1.get(2000, {}).get("source") == "archive"
+          and _p1[2000]["available"] is True,
+          "pre1/2000 走冻结归档（source=archive 且 available）", _p1.get(2000))
 
     _mismatch, _missing_reason, _n_avail = [], [], 0
     for _item in catalog["leads"]:
@@ -693,24 +731,48 @@ try:
           "取到一组可用组合（数量动态，不写死）", _avail_pair)
 
     # --- A7.2 组合不可用 => 400（文案含组合标识 + 原因，且不含路径）
-    _UNAVAIL = ("pre3", 2011)                # 该年不在候选网格里，恒不可用
-    r = client.post("/api/chain/jobs?year=%d&lead=%s&which=cio" % (_UNAVAIL[1], _UNAVAIL[0]),
-                    files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
-    check(r.status_code == 400
-          and ("%s/%d" % _UNAVAIL) in r.text
-          and not any(m in r.text for m in _a7_path_markers),
-          "400：不可用组合带组合标识与原因（无绝对路径）",
-          "%s %s" % (r.status_code, r.text[:200]))
-    # 4.2：格式非法与"组合不可用"必须是两句不同的话
-    r = client.post("/api/chain/jobs?year=2000&lead=prex&which=cio",
-                    files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
-    check(r.status_code == 400 and "格式" in r.text,
-          "400：lead 格式非法走另一句文案", "%s %s" % (r.status_code, r.text[:160]))
-    r = client.post("/api/chain/jobs?year=2000&lead=pre2&which=cio",
-                    files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
-    check(r.status_code == 400 and "pre2/2000" in r.text and "格式" not in r.text,
-          "400：lead 合法但组合不可用 -> 组合文案（不是格式文案）",
-          "%s %s" % (r.status_code, r.text[:160]))
+    # 同样用**猴补根指向不存在路径**构造"不可用"（见上：不写死"某个组合反正没有"），
+    # 并在**同一段猴补**里配正向对照：`pre1/2000`（归档短路，不查盘）仍放行 ⇒ 上面的
+    # 400 确实来自可用性谓词，而不是"什么都 400"。
+    _real_roots = lp.MODEL_ROOTS
+    lp.MODEL_ROOTS = [TMP_BASE / "_no_such_model_root"]
+    try:
+        _UNAVAIL = ("pre3", 2011)
+        _UNAVAIL_reason = lp.resolve_model_group(*_UNAVAIL)["reason"]
+        r = client.post("/api/chain/jobs?year=%d&lead=%s&which=cio"
+                        % (_UNAVAIL[1], _UNAVAIL[0]),
+                        files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+        _detail = r.json().get("detail", "") if r.status_code == 400 else r.text
+        check(r.status_code == 400
+              and ("%s/%d" % _UNAVAIL) in _detail
+              and bool(_UNAVAIL_reason) and _UNAVAIL_reason in _detail
+              and not any(m in _detail for m in _a7_path_markers),
+              "400：不可用组合带组合标识与**派生**原因（无绝对路径）",
+              "%s %s || 派生原因=%r" % (r.status_code, r.text[:200], _UNAVAIL_reason))
+        _ctrl_ok, _ctrl_msg = True, None
+        try:
+            ch._require_available("pre1", 2000)
+        except Exception as _exc_ctrl:            # noqa: BLE001
+            _ctrl_ok, _ctrl_msg = False, repr(_exc_ctrl)
+        check(_ctrl_ok,
+              "同根对照：pre1/2000（归档）仍放行 ⇒ 上面的 400 不是'什么都 400'",
+              _ctrl_msg)
+        # 4.2：格式非法与"组合不可用"必须是两句不同的话
+        r = client.post("/api/chain/jobs?year=2000&lead=prex&which=cio",
+                        files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+        check(r.status_code == 400 and "格式" in r.text,
+              "400：lead 格式非法走另一句文案", "%s %s" % (r.status_code, r.text[:160]))
+        r = client.post("/api/chain/jobs?year=2000&lead=pre2&which=cio",
+                        files={"file": ("CIO.npy", npy_bytes(GOLD_ARR))})
+        _p2_reason = lp.resolve_model_group("pre2", 2000)["reason"]
+        _detail2 = r.json().get("detail", "") if r.status_code == 400 else r.text
+        check(r.status_code == 400 and "pre2/2000" in _detail2
+              and bool(_p2_reason) and _p2_reason in _detail2
+              and "格式" not in _detail2,
+              "400：lead 合法但组合不可用 -> 组合文案（不是格式文案）",
+              "%s %s" % (r.status_code, r.text[:160]))
+    finally:
+        lp.MODEL_ROOTS = _real_roots
 
     # --- A7.3 可用组合：受理通过 + 落盘 + 下载文件名跟随实际 (lead, year)
     #
@@ -1203,9 +1265,13 @@ try:
         r = client.get("%s/%s/series" % (CHAIN_PREFIX, jid))
         check(r.status_code == 200, "/series -> 200", r.text[:120])
         series = r.json()
+        # 口径变更（target-window-contract）：**旧 6 键逐字保留**，新增
+        # `targetWindow`（目标年窗口预览卡）。仍是集合**相等**断言 ——
+        # 谁少一个键、谁多塞一个键都要先改这里，不许降级成子集判断。
         check(set(series) == {"projectionMode", "calendarKnown", "dates",
-                              "sampleIndices", "raw", "normalizedWindow"},
-              "/series 字段名与旧端点逐字一致", sorted(series))
+                              "sampleIndices", "raw", "normalizedWindow",
+                              "targetWindow"},
+              "/series = 旧 6 键逐字保留 + 新增 targetWindow", sorted(series))
         raw = np.asarray(series["raw"], dtype=np.float64)
         diff = float(np.max(np.abs(raw - GOLD_ARR)))
         check(raw.size == GOLD_ARR.size and diff < 1e-6,

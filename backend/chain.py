@@ -609,12 +609,106 @@ def _window_calendar(job_id: str, series: np.ndarray) -> dict:
     年份读任务状态而不是入参 `projection`：`.zip` 的年表是① 跑完才有的，而
     `_run_chain_job` 传给② 的 `projection` 仍是受理时那一份（`_advance` 是写状态，
     不是改这个局部 dict）。
+
+    返回值多一个 `source`（`u850-calendar` / `uniform-calendar`）：它是**在本函数
+    的分支里就地打的标记**，不是调用方二次推导 —— 消费方（阶段② 归一化、`/series`
+    的 targetWindow）据此对外说明"这个窗口是按谁的年表摘的"，而判断点只有这一处，
+    年表来源与标记结构上不可能分叉。
     """
     state = _get_job(job_id).get("projection") or {}
     days_per_year = state.get("daysPerYear")
     if isinstance(days_per_year, dict) and days_per_year:
-        return {"daysPerYear": days_per_year, "year": state.get("year")}
-    return prediction.uniform_year_calendar(series.size, state.get("year"))
+        return {"daysPerYear": days_per_year, "year": state.get("year"),
+                "source": "u850-calendar"}
+    return {**prediction.uniform_year_calendar(series.size, state.get("year")),
+            "source": "uniform-calendar"}
+
+
+def _window_month_days(lead_index: int) -> list[list[int]]:
+    """`cioproj.window(lead)` 口径下的 112 个 `[月, 日]`（左闭右开窗口的逐日展开）。
+
+    取日规则与 `cioproj.load_field` 同源：nc 里每天存的是 2–29 日，只留落在
+    `in_window` 里的那些。窗口本身由 `cioproj.window` 定，这里不另立一套月份/日界。
+
+    它同时服务两个入口：`.zip` 有真实日期，可以拿它**核对**（真实日期推出的
+    (月, 日) 必须与它逐值相等，见测试 A4）；`.npy` 没有日期索引，它就是图上
+    唯一的 x 轴（点号 → 月/日）。
+    """
+    cioproj.window(lead_index)          # lead 越界（不在 1..20）即 ValueError
+    days = [[month, day] for month in cioproj.MONTHS
+            for day in range(2, 30) if cioproj.in_window(month, day, lead_index)]
+    if len(days) != prediction.N_STEPS:
+        raise ValueError(
+            f"窗口口径算出的天数 {len(days)} ≠ {prediction.N_STEPS}（pre{lead_index}）"
+        )
+    return days
+
+
+def _target_window(job_id: str, job: dict, series: np.ndarray,
+                   dates: list | None) -> dict:
+    """目标年窗口预览卡（`/series` 新增的 `targetWindow`）：**只由阶段① 的数据算出**。
+
+    定位走**阶段② 的那一条路径**：年表来自 `_window_calendar`（`.zip` 读 U850 的
+    真实年表、`.npy` 造均匀年表 —— 分支就在那里，本函数不再选一次），起点来自
+    `prediction.locate_year_window`。本函数不重算任何口径，所以 `start`/`end`
+    与 `normalization.selectedRange` **必然**逐值相等（同源，不是两条等价实现）。
+
+    **不读 `normalization`**：阶段② 的结果不是本字段的输入。读了就成了"预览卡复述
+    推理卡"，两处一起错照样是绿的（本文件里 D1 用"摘掉 normalization"钉住这一点）。
+
+    定位失败（年表缺该年 / 该年天数不为 112 / 窗口越界 / 日期索引盖不住窗口）
+    **不抛 500、也不静默退回第 0 点**：返回 `available=false` + `reason`，且
+    `start`/`end`/`dates`/`monthDay` 一律 `null`。退回 0 点是最坏的一种"看起来
+    正常"：图上会画出**错 1344 天**的目标年，而且没人看得出来。
+    """
+    state = job.get("projection") or {}
+    lead_index = state.get("lead")
+    year = state.get("year")
+    calendar = _window_calendar(job_id, series)
+    payload = {
+        "available": False,
+        "year": year,
+        "lead": f"pre{lead_index}" if isinstance(lead_index, int) else None,
+        "start": None,                  # 失败时**必须**是 null，不是 0
+        "end": None,
+        "dates": None,
+        "monthDay": None,
+        # 年表来源由 `_window_calendar` 就地打标（同一个判断点），此处只转发
+        "source": calendar.get("source"),
+        "reason": None,
+    }
+    if not isinstance(lead_index, int) or not isinstance(year, int):
+        payload["reason"] = "任务状态里没有目标组合（lead/year），无法定位窗口"
+        return payload
+
+    span = prediction.N_STEPS
+    try:
+        start = prediction.locate_year_window(
+            calendar.get("daysPerYear"), year, int(series.size), span
+        )
+        month_days = _window_month_days(lead_index)
+    except ValueError as exc:
+        payload["reason"] = str(exc)
+        return payload
+
+    end = start + span
+    if dates is not None and len(dates) < end:
+        payload["reason"] = (
+            f"日期索引只有 {len(dates)} 天，覆盖不到目标年 {year} 的窗口 "
+            f"[{start}, {end})"
+        )
+        return payload
+
+    payload.update({
+        "available": True,
+        "start": start,
+        "end": end,                     # 左闭右开：[start, end)
+        # `.npy` 入口没有日期索引（dates=None）：图上给不出真实日历，但窗口
+        # 口径的 monthDay 仍在，前端不是一张空白卡
+        "dates": None if dates is None else [str(item) for item in dates[start:end]],
+        "monthDay": month_days,
+    })
+    return payload
 
 
 def _run_stage2(job_id: str, job_dir: Path, projection: dict) -> np.ndarray:
@@ -865,7 +959,12 @@ def chain_job_status(job_id: str):
 
 @router.get("/jobs/{job_id}/series")
 def chain_job_series(job_id: str):
-    """投影序列与归一化窗口。字段名与 `/api/cio/jobs/{id}/series` 逐字一致。"""
+    """投影序列与归一化窗口。字段名与 `/api/cio/jobs/{id}/series` 逐字一致。
+
+    **只增不改**：旧 6 键（projectionMode / calendarKnown / dates / sampleIndices /
+    raw / normalizedWindow）取值口径不动，新增 `targetWindow` 目标年窗口预览卡
+    （谁的年表、窗口落在哪 112 天、哪些情况下定位不到）。
+    """
     job, raw = _require_series(job_id)
     job_dir = _job_dir(job)
     dates_path = _dates_path(job_dir)
@@ -883,6 +982,135 @@ def chain_job_series(job_id: str):
         "sampleIndices": list(range(int(raw.size))) if dates is None else None,
         "raw": np.ravel(raw).tolist(),
         "normalizedWindow": np.ravel(normalized).tolist(),
+        # 只吃① 的年表与序列：阶段② 未跑完（甚至没跑）时这张卡也该是准的
+        "targetWindow": _target_window(job_id, job, raw, dates),
+    }
+
+
+@router.get("/jobs/{job_id}/projection-preview")
+def chain_projection_preview(
+    job_id: str,
+    time_index: int = Query(0, ge=0),
+):
+    """阶段①只读诊断：目标年真实 U850 场 → 训练口径中间量 → 格点投影贡献。
+
+    卡片文案必须把三个量各自**是什么**说清（见下面 `stage_payload` 调用点）：
+    ① 是目标年真实 U850 场；② **不是** U850 原始场，而是去日序平均/高通/标准化
+    之后的中间量；③ 等于② 乘第一模态权重。三者混为一谈是这张卡最容易犯的错。
+
+    响应另附窗口元信息（`targetYear` / `dates` / `window` / `calendarKnown`），
+    前端不必再去 `/series` 拼一枪才能给图标注"这是哪一年哪 112 天"。
+    """
+    job, _series = _require_series(job_id)
+    if job.get("projectionMode") != "u850_only":
+        raise HTTPException(409, "只有原始 U850 入口包含投影过程对照")
+
+    path = _projection_preview_path(_job_dir(job))
+    if not path.is_file():
+        raise HTTPException(404, "该任务没有投影过程对照产物，请重新运行投影")
+
+    try:
+        preview = _read_projection_preview(path)
+    except _ProjectionPreviewValidationError as exc:
+        # 不暴露任务目录或底层 npz 异常；损坏产物不允许用全零或半截数据降级。
+        raise HTTPException(500, "投影过程对照产物无效：%s" % exc) from exc
+
+    raw_all = preview["raw"]
+    processed_all = preview["processed"]
+    weights = preview["weights"]
+    dates = preview["dates"]
+    projected = preview["projected"]
+    contribution_all = preview["contribution"]
+    average_abs = preview["averageAbs"]
+    total_steps = _PROJECTION_PREVIEW_STEPS
+    if time_index < 0 or time_index >= total_steps:
+        raise HTTPException(422, f"time_index 必须小于 {total_steps}")
+
+    raw = raw_all[:, :, time_index]
+    processed = processed_all[:, :, time_index]
+    # 统计统一在 float64 中完成；不应用陆海掩膜、不做平滑，确保与 CIO 闭合。
+    contribution = contribution_all[:, :, time_index]
+    positive_sum = float(np.sum(contribution[contribution > 0], dtype=np.float64))
+    negative_sum = float(np.sum(contribution[contribution < 0], dtype=np.float64))
+    net = float(np.sum(contribution, dtype=np.float64))
+    projected_cio = float(projected[time_index])
+    closure_error = net - projected_cio
+    date_strings = [str(item) for item in dates]
+
+    # 窗口元信息取自任务状态（与 /series 的 targetWindow 同一个任务组合）。
+    # lead 取不到就不给 window（None），不拿默认值凑一个"看起来对"的窗口。
+    state = job.get("projection") or {}
+    lead_index = state.get("lead")
+    window = None
+    if isinstance(lead_index, int):
+        try:
+            window = [list(bound) for bound in cioproj.window(lead_index)]
+        except ValueError:
+            window = None
+
+    def stage_payload(key: str, title: str, description: str, unit: str,
+                      frame: np.ndarray, scale_max: float) -> dict:
+        return {
+            "key": key,
+            "title": title,
+            "description": description,
+            "unit": unit,
+            "scaleMax": float(max(scale_max, 1e-12)),
+            "data": frame.tolist(),
+            "lat": cioproj.LAT_TGT.tolist(),
+            "lon": cioproj.LON_TGT.tolist(),
+        }
+
+    return {
+        "timeIndex": time_index,
+        "totalSteps": total_steps,
+        "date": date_strings[time_index],
+        # 本产物里的 dates 就是**目标年**的逐日日期（① 按 diagnostic_year 采样），
+        # 与 /series 的 targetWindow.dates 同源同值
+        "dates": date_strings,
+        "targetYear": state.get("year"),
+        "window": window,
+        "calendarKnown": bool(job.get("calendarKnown")),
+        "projectedCio": projected_cio,
+        "contributionSum": net,
+        "selectedContribution": {
+            "positiveSum": positive_sum,
+            "negativeSum": negative_sum,
+            "net": net,
+            "projectedCio": projected_cio,
+            "closureError": closure_error,
+        },
+        "windowContribution": {
+            "averageAbs": average_abs.tolist(),
+            "dates": date_strings,
+            "rows": int(average_abs.shape[0]),
+            "cols": int(average_abs.shape[1]),
+            "scaleMin": 0.0,
+            "scaleMax": float(max(float(np.max(average_abs)), 1e-12)),
+            "unit": "CIO 贡献",
+            "lat": cioproj.LAT_TGT.tolist(),
+            "lon": cioproj.LON_TGT.tolist(),
+        },
+        "stages": [
+            stage_payload(
+                "input", "目标年真实 U850 场",
+                "裁剪并插值到 1° 网格的目标年真实 U850 场，尚未执行训练预处理",
+                "m/s", raw, float(np.max(np.abs(raw_all))),
+            ),
+            stage_payload(
+                "processed", "训练口径中间量（不是 U850 原始场）",
+                "不是 U850 原始场：日序平均 = 把各年同一日序的场平均得到的当日气候态；"
+                "本图 = 原始 U850 场 − 日序平均 − 历史纬向高通项，再按训练常数标准化",
+                "标准化值", processed, float(np.max(np.abs(processed_all))),
+            ),
+            stage_payload(
+                "contribution", "格点投影贡献",
+                "等于上面的中间量（不是 U850 原始场）乘第一模态权重；"
+                "沿格点求和得到 CIO",
+                "CIO 贡献", contribution,
+                float(np.max(np.abs(contribution_all))),
+            ),
+        ],
     }
 
 
