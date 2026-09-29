@@ -31,6 +31,7 @@
 
 跑法：`python test_model_catalog.py`
 """
+import hashlib
 import json
 import os
 import shutil
@@ -38,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 # ── 必须在 import 后端模块之前（tasks 4.5 / design D7）─────────────────────
@@ -76,14 +78,25 @@ from fastapi.testclient import TestClient       # noqa: E402
 # 隔离：manifest 落盘目录猴补到临时区（不猴补就会读写真实的 backend/uploads/）
 lp.MODEL_SCAN_MANIFEST_DIR = MANIFEST_DIR
 
-# 真实 `backend/uploads/` 的 manifest **现状签名**（名字 → (大小, mtime_ns)）：
+# 真实 `backend/uploads/` 的 manifest **现状签名**（名字 → (大小, mtime_ns, sha256)）：
 # 本套件只许读它、不许写它（C-4）。⚠ 不能断言"真实目录下一个 manifest 都没有" ——
 # 生产/实测正常跑过一次预热就会留下**合法产物**，那种断言会红在别人的合法产物上。
-# 要证的是"**本套件**没写它" ⇒ 跑前跑后签名必须相等（重写同名文件也会被 mtime 抓到）。
-_REAL_MANIFEST_SIG = {
-    p.name: (p.stat().st_size, p.stat().st_mtime_ns)
-    for p in (HERE / "uploads").glob("model_scan_manifest_*.json")
-}
+# 要证的是"**本套件**没写它" ⇒ 跑前跑后签名必须相等。
+def _manifest_sig(root) -> dict:
+    """签名的第三个分量是 **sha256**，不是装饰：见 `_live_backend()` 上方的归因规则。"""
+    sig = {}
+    for p in sorted(Path(root).glob("model_scan_manifest_*.json")):
+        try:
+            raw = p.read_bytes()
+        except OSError:                      # 读不到就退回时间戳判据（宁严不宽）
+            sig[p.name] = (p.stat().st_size, p.stat().st_mtime_ns, None)
+            continue
+        sig[p.name] = (len(raw), p.stat().st_mtime_ns,
+                       hashlib.sha256(raw).hexdigest())
+    return sig
+
+
+_REAL_MANIFEST_SIG = _manifest_sig(HERE / "uploads")
 
 app = FastAPI()
 app.include_router(ch.router)
@@ -127,6 +140,45 @@ def check_no_leak(doc, label):
     hits = _leak_hits(doc)
     return check(not hits, label,
                  ["%s = %s" % (w, v) for w, v in hits][:3])
+
+
+# ───────────────────────────────────────────────────────────── 归因规则（J 段用）
+# 真实 `backend/uploads/` 里的 manifest **不是本套件独有**：只要有一个后端在跑，
+# 它的 `_background_scan_loop` 就每 `MODEL_SCAN_TTL`(默认 300 s) 调一次
+# `write_model_scan_manifest()`（C006 的周期兜底，**PM 确认过必须有**），而且写的
+# 是**同一份文件**、内容逐字节相同，只是 **mtime 前进**。
+#
+# 所以 (size, mtime) 相等这条判据**只在没有并发后端时才可判定**：
+#   · 无并发后端 ⇒ "文件变了"只能是本套件写的 ⇒ 判红（判据照旧，牙口不变）；
+#   · 有并发后端 ⇒ "文件变了"既可能是它刷新、也可能是本套件写的 ⇒ **不可归因**，
+#     只能跳过 —— 硬判就是拿一个无法归因的量去定罪。
+#
+# 实证（2026-09-28）：20:10:57 → 20:15:57 **精确 300.0 s** 一次，正是 8000 启动
+# 时刻 17:30:51 + 9600 s(=32×300 s) 那一拍 + 6 s 扫描耗时；观察期间未跑任何测试。
+# 套件时长 ~90 s ⇒ 后端在跑时约 **30% 概率假红**（运行手册描述的"两站点常驻"正是
+# 这个前提）。假红的代价不只是噪声：失败文案写的是"本套件一个字节都没写它"，
+# 后来者会据此去改**本来正确**的猴补。
+def _live_backend() -> str:
+    """探测"正在按周期重写真实清单"的后端（运行手册的三个端口），返回 `host:port` 或 ""。
+
+    判据必须能**认出是本项目后端**，不能只看端口通不通 —— 别的程序占着 8000 也会
+    让探测为真，把一个本该判红的运行误跳过（假跳过 = 白丢覆盖）。这里要求
+    `/openapi.json` 的 `paths` 里含 `/api/chain/models`（本项目自有路由）。
+    顺带 `ProxyHandler({})` 关掉代理：本机回环不该走桌面代理。
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for port in (8000, 8001, 8002):
+        try:
+            with opener.open("http://127.0.0.1:%d/openapi.json" % port,
+                             timeout=1.0) as resp:
+                if resp.status != 200:
+                    continue
+                doc = json.loads(resp.read().decode("utf-8"))
+        except Exception:                    # noqa: BLE001 连不上/非 JSON 一律算"没有"
+            continue
+        if "/api/chain/models" in (doc.get("paths") or {}):
+            return "127.0.0.1:%d" % port
+    return ""
 
 
 # ---------------------------------------------------------------- 合成夹具
@@ -957,12 +1009,26 @@ check(_rc == 0 and _vals == (120.0, 7.0, 2.5) and "MODEL_SCAN_TTL" not in _err,
 
 # ------------------------------------------------------------ J. 收尾与诊断
 print("\nJ. 真实工作区未被写入 + 真实盘面诊断（带 skip）")
-_real_after = {p.name: (p.stat().st_size, p.stat().st_mtime_ns)
-               for p in (HERE / "uploads").glob("model_scan_manifest_*.json")}
-check(_real_after == _REAL_MANIFEST_SIG,
-      "真实 backend/uploads/ 的 manifest 签名**跑前跑后一致**（本套件一个字节都没写它）",
-      (sorted(set(_real_after) ^ set(_REAL_MANIFEST_SIG)),
-       sorted(_real_after.items())[:2]))
+_real_after = _manifest_sig(HERE / "uploads")
+_peer = _live_backend()
+if _peer and _real_after != _REAL_MANIFEST_SIG:
+    # 有并发后端 + 文件确实变了 ⇒ 无法归因（见 `_live_backend()` 上方的规则）。
+    # 注意跳过的是**本项**，不是整段 J：下面的盘面诊断照跑。
+    _only_mtime = ({k: v[2] for k, v in _real_after.items()}
+                   == {k: v[2] for k, v in _REAL_MANIFEST_SIG.items()})
+    skip("真实 backend/uploads/ 的 manifest 未被本套件写入",
+         "检测到并发后端 %s：它按 MODEL_SCAN_TTL(%.0f s) 周期重写**同一份文件**"
+         "（%s），本轮无法把变更归因给本套件 ⇒ 不可判定。"
+         "要拿到这项结论，请停掉全部后端后重跑本套件"
+         % (_peer, lp.MODEL_SCAN_TTL,
+            "内容 sha256 未变、仅 mtime 前进，形态与周期刷新吻合" if _only_mtime
+            else "内容与 mtime 均变"))
+else:
+    # 无并发后端（或文件根本没变）⇒ 判据与修此假红之前**逐字相同**：牙口不变。
+    check(_real_after == _REAL_MANIFEST_SIG,
+          "真实 backend/uploads/ 的 manifest 签名**跑前跑后一致**（本套件一个字节都没写它）",
+          (sorted(set(_real_after) ^ set(_REAL_MANIFEST_SIG)),
+           sorted(_real_after.items())[:2]))
 
 _d_re, _e_re, _f_re = (HERE.parent / "model" / "服务器模型_pt",
                        Path("E:/服务器模型_pt"), Path("F:/服务器模型_pt"))
