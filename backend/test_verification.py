@@ -226,6 +226,23 @@ for bad in ("abc", 0.2, 1.5):
     except ValueError:
         check(True, "非法置信水平 %r 报错" % (bad,))
 
+# A11 重点区域评价：蓝框切片、区域序列、指标和无定义 r 的处理
+focus_pred = np.zeros((81, 101, 112))
+focus_truth = np.zeros((81, 101, 112))
+signal = np.linspace(-1, 1, 112)
+focus_pred[12:29, 48:85, :] = signal
+focus_truth[12:29, 48:85, :] = signal * 2
+focus_r = np.full((81, 101), np.nan)
+focus_r[12:29, 48:85] = 0.5
+focus_r[12, 48] = np.nan
+focus = V.focus_region_summary(focus_pred, focus_truth, focus_r)
+check(focus["region"]["gridPoints"] == 629 and focus["pairedDays"] == 112,
+      "重点区采用 112–121E、23–27N 共 629 个格点", focus["region"])
+check(abs(focus["seriesR"] - 1.0) < 1e-12 and abs(focus["rmse"] - np.sqrt(np.mean(signal ** 2))) < 1e-12,
+      "重点区区域序列 r/RMSE 按逐日空间平均后计算", (focus["seriesR"], focus["rmse"]))
+check(focus["meanPointR"] == 0.5 and focus["definedPointR"] == 628 and focus["undefinedPointR"] == 1,
+      "重点区格点 r 平均排除无定义点", (focus["meanPointR"], focus["definedPointR"]))
+
 # A11 find_truth：缺失 / 一致 / 不一致
 print("B. 实况场歧义判据（临时目录构造）")
 with tempfile.TemporaryDirectory() as tmp:

@@ -587,8 +587,6 @@ try:
     bad_cases = [
         (dict(files={"file": ("readme.txt", b"hello")}, params={}),
          "只接受 .npy（CIO 序列）或 .zip（原始气象场）", "非 npy/zip"),
-        (dict(files={"file": ("原始场.zip", ZIP_BYTES)}, params={}),
-         "判不出输入类别", "zip 名判不出类别"),
         (dict(files={"file": ("cesm.sst.2000.zip", ZIP_BYTES)},
               params={"which": "sst"}), "SST 分支尚未实现", "which=sst"),
         (dict(files={"file": ("cesm.sst.2000.zip", ZIP_BYTES)},
@@ -613,6 +611,14 @@ try:
         r = client.post("/api/chain/jobs", params=params, **kwargs)
         check(r.status_code == 400 and want_msg in r.text,
               "400：%s" % label, "%s %s" % (r.status_code, r.text[:160]))
+
+    r = client.post('/api/chain/jobs?onlyProjection=true',
+                    files={'file': ('dataset.zip', ZIP_BYTES)})
+    check(r.status_code == 202, '匿名 zip 根据 NetCDF 元数据受理', r.text[:160])
+    if r.status_code == 202:
+        adapted = wait(r.json()['jobId'])
+        check(adapted['status'] == 'completed', '匿名 zip 投影完成', adapted.get('error'))
+        check(bool(adapted.get('projection', {}).get('adaptation')), '适配报告随任务返回')
 
     r = client.post("/api/chain/jobs",
                     files={"file": ("cesm.uwnd.5-9.zip", ZIP_BYTES,
@@ -677,6 +683,9 @@ try:
     # 判据来源：`.harness/spec/changes/import-all-models/` 的 tasks.md §1/§2/§3/§4。
     # **组数是动态的**（权重仍在下载）：下面一律实测，不写死任何组数。
     print("A7. 权重组清单与放开受理（import-all-models）")
+    # Match service startup: reuse only manifest entries whose directory mtime
+    # still matches. Avoid an unrelated cold scan of millions of checkpoints.
+    lp.load_model_scan_manifest()
     _a7_path_markers = ("C:", "D:", ":\\", "\\\\")
 
     # --- A7.1 清单端点：形状 / 不变量 / 无路径
@@ -1461,6 +1470,18 @@ try:
               "链路格点实况来自本任务已校验的 real2 文件", grid.get("truthName"))
         check(grid["r"] is not None and abs(grid["r"] - 1.0) < 1e-6,
               "链路格点端点返回同口径 Pearson r", grid["r"])
+        r = client.get("%s/%s/focus-region" % (CHAIN_PREFIX, job["jobId"]))
+        focus = r.json()
+        check(r.status_code == 200 and len(focus["pred"]) == 112
+              and len(focus["truth"]) == 112 and focus["pairedDays"] == 112,
+              "链路重点区端点返回本任务 112 点预测/实况序列", r.status_code)
+        check(focus["region"]["gridPoints"] == 629
+              and abs(focus["seriesR"] - 1.0) < 1e-6
+              and abs(focus["meanPointR"] - 1.0) < 1e-6,
+              "链路重点区指标沿用蓝框 629 点并与构造真值一致", focus)
+        r = client.get("%s/%s/download/focus-region" % (CHAIN_PREFIX, job["jobId"]))
+        check(r.status_code == 200 and b"region_mean_prediction" in r.content,
+              "链路重点区 CSV 可下载", r.status_code)
         r = client.get("%s/%s/download/pearson" % (CHAIN_PREFIX, job["jobId"]))
         check(r.status_code == 200, "download/pearson 可下载", r.status_code)
 
@@ -1623,76 +1644,31 @@ try:
                 lp.MODEL_ARCHIVE = real_model_archive
                 lp._run_archive_inference = fake_inference
 
-            # ⑥ **执行路径**上"路径只在 message 里、`.filename` 为空"的异常（T4-4）。
-            #    `.filename` 分支天然接不住这一类：`cioproj.read_nc()` 聚合四个 nc
-            #    后端后抛的是 `RuntimeError`（`.filename` 恒无），nc 的绝对路径写在
-            #    message 里 → 走 else 原样透出 → `error` 前端上屏（R3-4 同一条链）。
-            #    载体用**真**坏件：成员名/结构照旧，只把 nc 内容换成垃圾字节 ——
-            #    受理与解压都只看名字，所以必然一路走到读 nc 才炸。
-            def _bad_input_case(label, payload):
-                """投一份必然在**执行路径**上炸的 zip，返回终态 job。"""
-                resp = client.post(
-                    "%s?year=2000&lead=pre1&which=u850" % CHAIN_PREFIX,
-                    files={"file": ("cesm.uwnd.5-9.zip", payload,
-                                    "application/zip")})
-                check(resp.status_code == 202,
-                      "%s：受理仍 202（O(1) 校验只看名字）" % label,
-                      "%s %s" % (resp.status_code, resp.text[:160]))
-                return wait(resp.json()["jobId"])
+            # Metadata validation now rejects corrupt NC contents before scheduling.
+            resp = client.post(
+                "%s?year=2000&lead=pre1&which=u850" % CHAIN_PREFIX,
+                files={"file": ("dataset.zip", build_zip(NCS, corrupt=True), "application/zip")})
+            check(resp.status_code == 400 and "无法读取 NetCDF" in resp.text,
+                  "nc 内容坏：受理阶段明确 400", resp.text[:200])
+            check_no_leak(resp.json(), "损坏 nc 的受理错误不泄漏磁盘路径")
 
-            bad_job = _bad_input_case("nc 内容坏", build_zip(NCS, corrupt=True))
-            bad_err = bad_job.get("error") or ""
-            check(bad_job.get("status") == "failed",
-                  "nc 内容坏：任务终态 failed", bad_job.get("status"))
-            check(bool(bad_err), "nc 内容坏：error 文案非空（不是闷失败）",
-                  bad_err[:160])
-            check(_DRIVE_RE.search(bad_err) is None,
-                  "执行路径 error 不含 <盘符>:<分隔符> 片段（message 带路径、"
-                  ".filename 为空）", bad_err[:200])
-            check_no_leak(bad_job,
-                          "执行路径失败的终态响应递归扫不到绝对路径（T4-4）")
-            shutil.rmtree(JOB_ROOT / bad_job["jobId"], ignore_errors=True)
-
-            # ⑦ 同族的**第二个可达点**：路径不是第三方载荷，而是模块自己用 `%s`
-            #    拼进 message 的（`cioproj.load_field` 的 `nc_dir=%s`）。成员名保留
-            #    年份（`_zip_years` 要认得出 2000），但月份给 12 —— 窗口只取 5–9 月，
-            #    于是一天都没读到 → 抛带绝对目录的 `RuntimeError`。这条只有**通用
-            #    剥离**挡得住，钉住"不是只修一处特例"。
-            #    ⚠ 2026-09-21 契约变更（import-all-models）：受理阶段新增"目标年
-            #    5–9 月必须齐"的**必要**条件预判（frontend-contract §2），链路入口
-            #    对这份载荷**同步 400** —— 该可达点在链路侧按契约失效（守卫没丢，
-            #    是被提前拦下了）。旧路由 `/api/predict` 的受理口本轮**不动**
-            #    （红线：不碰 prediction.py），同一份载荷仍能走到 `load_field`，
-            #    所以"模块自抛的绝对**目录**也要被剥掉"这条覆盖**改由旧路由承载**，
-            #    断言一条不减。
+            # Deliberately misleading member names cannot override real CF dates.
             odd_payload = build_zip(
                 NCS, name_of=lambda _p, i:
                 "cesm.u850.anom.daily.20001202-28days_%02d.nc" % i)
             resp = client.post(
-                "%s?year=2000&lead=pre1&which=u850" % CHAIN_PREFIX,
-                files={"file": ("cesm.uwnd.5-9.zip", odd_payload,
-                                "application/zip")})
-            check(resp.status_code == 400 and "[5, 6, 7, 8, 9]" in resp.text,
-                  "nc 名不匹配：链路受理同步 400（目标年 5–9 月缺失，"
-                  "不再是跑完才炸）",
-                  "%s %s" % (resp.status_code, resp.text[:160]))
-            check(_DRIVE_RE.search(resp.text) is None,
-                  "nc 名不匹配：链路 400 文案里没有绝对路径", resp.text[:200])
-            legacy_odd = legacy_client.post(
-                "/api/predict/jobs?year=2000&lead=pre1&which=u850",
-                files={"file": ("cesm.uwnd.5-9.zip", odd_payload,
-                                "application/zip")})
-            check(legacy_odd.status_code == 202,
-                  "nc 名不匹配：旧路由受理仍 202（受理只看名字）",
-                  "%s %s" % (legacy_odd.status_code, legacy_odd.text[:160]))
-            odd_job = wait(legacy_odd.json()["jobId"], prefix="/api/predict/jobs")
-            odd_err = odd_job.get("error") or ""
-            check(odd_job.get("status") == "failed",
-                  "nc 名不匹配：任务终态 failed", odd_job.get("status"))
-            check(_DRIVE_RE.search(odd_err) is None,
-                  "执行路径 error 里模块自抛的绝对目录也被剥掉", odd_err[:200])
-            check_no_leak(odd_job, "nc 名不匹配：整份响应递归扫不到绝对路径")
-            shutil.rmtree(lp.JOB_ROOT / odd_job["jobId"], ignore_errors=True)
+                "%s?year=2000&lead=pre1&which=u850&onlyProjection=true" % CHAIN_PREFIX,
+                files={"file": ("dataset.zip", odd_payload, "application/zip")})
+            check(resp.status_code == 202,
+                  "文件名月份错误：以真实时间坐标为准受理", resp.text[:160])
+            if resp.status_code == 202:
+                renamed_job = wait(resp.json()["jobId"])
+                check(renamed_job.get("status") == "completed",
+                      "重命名 NetCDF 仍正确完成投影", renamed_job.get("error"))
+                renamed_series = np.load(JOB_ROOT / renamed_job["jobId"] / "series.npy")
+                check(np.max(np.abs(renamed_series - GOLD_ARR.ravel())) < 1e-6,
+                      "文件名不会改变投影结果（与官方序列逐点对拍）")
+                check_no_leak(renamed_job, "重命名任务响应不泄漏磁盘路径")
 
         finally:
             lp._run_archive_inference = real_archive_infer

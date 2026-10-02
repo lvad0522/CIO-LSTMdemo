@@ -647,6 +647,7 @@ export default function CioProjectionResult({ job, confidence = '0.95' }) {
     : '上传的 projected CIO';
   const years = projection.years || [];
   const missingMonths = projection.missingMonths || [];
+  const adaptation = projection.adaptation;
   // `.npy` 入口：① 真的没跑过，写清楚而不是留一片看着像"跑了但空"的字段
   const stage1Skipped = Boolean(projection.stage1Skipped);
   const rows = [
@@ -663,6 +664,11 @@ export default function CioProjectionResult({ job, confidence = '0.95' }) {
     ['投影窗口', formatWindow(projection.window)],
     ['投影年份', years.length ? `${years[0]}-${years[years.length - 1]}（${years.length} 年）` : null],
     ['缺失月份', missingMonths.length ? `${missingMonths.length} 个` : (calendarKnown ? '无' : null)],
+    ['数据适配', adaptation ? `${adaptation.files.length} 个 NetCDF · ${adaptation.sourceSamples} 个源样本 → ${adaptation.selectedSamples} 个窗口样本` : null],
+    ['空间适配', adaptation ? '按经纬度插值至 1° 网格（41 × 81），850 hPa，风速统一为 m/s' : null],
+    ['时间采样', adaptation?.sampling],
+    ['未进入窗口的样本', adaptation ? `${adaptation.ignoredSamples} 个（窗口外日期或未选年份）` : null],
+    ['缺失窗口日期', adaptation ? `${adaptation.missingDates.length} 个` : null],
     ['任务耗时', job.durationSeconds != null ? `${job.durationSeconds} 秒` : null],
     ...coverageRows(data.completeness, job.result?.seriesLength || 0),
   ].filter(([, value]) => value != null && value !== '');
@@ -691,6 +697,21 @@ export default function CioProjectionResult({ job, confidence = '0.95' }) {
           ))}
         </div>
         {job.warning && <p className="smoke-warning">{job.warning}</p>}
+        {adaptation && (
+          <details className="metric-note">
+            <summary>查看数据适配明细</summary>
+            <p>{adaptation.preprocessing}</p>
+            {adaptation.missingDates.length > 0 && <p>缺失日期：{adaptation.missingDates.join('、')}</p>}
+            <ul>{adaptation.files.map(item => (
+              <li key={item.file}>
+                {item.file}：{item.variable} · {item.sourceDimensions.join(' × ')} · {item.sourceShape.join(' × ')}；
+                {item.sourceUnit} → {item.targetUnit}（×{item.unitFactor}）；
+                {item.dateStart} — {item.dateEnd}（{item.calendar}，{item.dateSource}）；
+                选中 {item.selectedSamples}/{item.sourceSamples} 点
+              </li>
+            ))}</ul>
+          </details>
+        )}
       </div>
 
       <div className="result-card">
@@ -747,7 +768,7 @@ export default function CioProjectionResult({ job, confidence = '0.95' }) {
 
           <section className="cio-panel">
             <span className="cio-panel-tag">(c)</span>
-            <h4>CIO 不同时间尺度的波动强度（21年平均）</h4>
+            <h4>CIO 不同时间尺度的波动强度{data.spectrum?.available ? `（${data.spectrum.blockCount} 个窗口平均）` : ''}</h4>
             {data.spectrum?.available ? (
               <ResponsiveContainer width="100%" height={230}>
                 <LineChart data={spectrumData} margin={{ top: 8, right: 12, bottom: 22, left: 8 }}>

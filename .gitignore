@@ -11,6 +11,14 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/.harness/
+.harness/*
+!/.harness/memory/
+.harness/memory/*
+!/.harness/memory/CODEX_MEMORY.md
+!/.harness/memory/codex_project_cio_validation_decisions_2026_09.md
+!/.harness/memory/codex_project_intro_animation.md
+!/.harness/memory/project_online_evaluation_and_research_scope.md
 
 # ---- 构建 / 运行产物 ----
 node_modules/
@@ -20,6 +28,10 @@ __pycache__/
 *.log
 uploads/
 *.egg-info/
+.pytest_cache/
+backend/_tmp_chain_50560/
+backend/_u850_full_run/
+backend/_t_tester/*.json
 
 # ---- 实验资产（实验室数据，不入库；来源见 backend/assets/README.md）----
 backend/assets/*.mat

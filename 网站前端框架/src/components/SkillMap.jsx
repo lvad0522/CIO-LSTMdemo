@@ -38,7 +38,7 @@ function gaussianSmooth(grid) {
           const nj = j + dj;
           if (nj < 0 || nj >= cols) continue;
           const v = grid[ni][nj];
-          if (Number.isNaN(v)) continue;      // NaN 不参与加权
+          if (!Number.isFinite(v)) continue;      // NaN 不参与加权
           const w = k1[di + r] * k1[dj + r];
           sum += v * w;
           wsum += w;
@@ -51,7 +51,7 @@ function gaussianSmooth(grid) {
   // 按原始 NaN 掩膜重置（数据坑不因邻格插值而视觉消失）
   for (let i = 0; i < rows; i++) {
     for (let j = 0; j < cols; j++) {
-      if (Number.isNaN(grid[i][j])) out[i][j] = NaN;
+      if (!Number.isFinite(grid[i][j])) out[i][j] = NaN;
     }
   }
   return out;
@@ -198,9 +198,28 @@ function MiniRow({ row, onClick }) {
   );
 }
 
-export default function SkillMap({ data, region, onGridClick }) {
+export default function SkillMap({ data, region, onGridClick, sampleCount, confidence = '0.95' }) {
   const { data: gridData, rows, cols } = data;
   const [geoData, setGeoData] = useState(null);
+  const [selected, setSelected] = useState(null);
+  const point = selected?.gridData === gridData ? selected : null;
+  // 历史数据契约为每年 112 点；阈值由后端 verification.critical_r(112, level) 对拍。
+  const thresholds = { '0.9': 0.1562, '0.95': 0.1857, '0.99': 0.2425 };
+  const criticalR = sampleCount === 112 ? thresholds[String(Number(confidence))] : undefined;
+  const summary = useMemo(() => {
+    const values = gridData.flat().filter(Number.isFinite).sort((a, b) => a - b);
+    if (!values.length) return null;
+    const n = values.length;
+    return {
+      mean: values.reduce((sum, value) => sum + value, 0) / n,
+      median: (values[Math.floor((n - 1) / 2)] + values[Math.floor(n / 2)]) / 2,
+      min: values[0], max: values[n - 1],
+      positive: values.filter(value => value > 0).length / n,
+      significantPositive: criticalR == null ? null : values.filter(value => value >= criticalR).length / n,
+      significantNegative: criticalR == null ? null : values.filter(value => value <= -criticalR).length / n,
+      undefined: rows * cols - n,
+    };
+  }, [gridData, rows, cols, criticalR]);
   useEffect(() => {
     let alive = true;
     fetch(GEO_URL)
@@ -212,6 +231,7 @@ export default function SkillMap({ data, region, onGridClick }) {
   // 平滑为纯展示层：上色/tooltip/等值线用平滑场，点击联动（传 i,j）不受影响
   const smoothed = useMemo(() => gaussianSmooth(gridData), [gridData]);
   const handleCellClick = (i, j) => {
+    setSelected({ gridData, i, j });
     // 点击仅联动时序图（整列红色高亮曾造成大红线，2026-08-25 已移除）
     if (onGridClick) onGridClick(i, j, region);
   };
@@ -223,6 +243,11 @@ export default function SkillMap({ data, region, onGridClick }) {
         预测技能空间分布
         <span className="region-badge">东亚</span>
       </h3>
+      <p className="metric-note">
+        {sampleCount ? `n = ${sampleCount} · ` : ''}
+        {criticalR == null ? '当前样本量未提供显著性阈值' : `${(Number(confidence) * 100).toFixed(0)}% 名义阈值：|r| ≥ ${criticalR.toFixed(4)}`}
+      </p>
+      <p className="chart-note">地图颜色经过空间平滑；以下统计和已选格点使用原始 Pearson r。显著性暂未校正时间自相关及多格点比较。</p>
       <div className="heatmap-container">
         <div className="map-body">
           {/* 纬度轴（左侧，40°N 顶 / 20°N 底，每 5°；北在上） */}
@@ -296,6 +321,8 @@ export default function SkillMap({ data, region, onGridClick }) {
                 strokeWidth={1.5}
                 vectorEffect="non-scaling-stroke"
               />
+              {point && <rect x={point.j} y={rows - 1 - point.i} width={1} height={1}
+                fill="none" stroke="#111" strokeWidth={2} vectorEffect="non-scaling-stroke" />}
             </svg>
           </div>
         </div>
@@ -318,6 +345,34 @@ export default function SkillMap({ data, region, onGridClick }) {
           <span>1.0</span>
         </div>
       </div>
+      {point && (() => {
+        const value = gridData[point.i][point.j];
+        const finite = Number.isFinite(value);
+        const significant = finite && criticalR != null && Math.abs(value) >= criticalR;
+        return (
+          <div className="pearson-point-readout" role="status">
+            <span>已选格点</span>
+            <strong>{(100 + point.j * 25 / (cols - 1)).toFixed(2)}°E，{(20 + point.i * 20 / (rows - 1)).toFixed(2)}°N</strong>
+            <span>Pearson 系数</span><strong>{finite ? `r = ${value.toFixed(4)}` : 'r 无定义'}</strong>
+            <span className={`pearson-point-status ${significant ? 'is-significant' : ''}`}>
+              {!finite ? '该格点 r 无定义' : criticalR == null ? '暂无显著性阈值' : significant ? '达到当前显著性阈值' : '未达到当前显著性阈值'}
+            </span>
+          </div>
+        );
+      })()}
+      {!point && <p className="chart-note">点击地图格点查看经纬度、原始 Pearson r 与显著性状态。</p>}
+      {summary && <section className="focus-evaluation-group" style={{ marginTop: 16 }}>
+        <h4>技巧摘要</h4>
+        <div className="prediction-summary">
+          <span>平均相关系数</span><strong>{summary.mean.toFixed(4)}</strong>
+          <span>中位数</span><strong>{summary.median.toFixed(4)}</strong>
+          <span>范围</span><strong>{summary.min.toFixed(3)} ～ {summary.max.toFixed(3)}</strong>
+          <span>正相关格点</span><strong>{(summary.positive * 100).toFixed(1)}%</strong>
+          <span>显著正相关（名义）</span><strong>{summary.significantPositive == null ? '—' : `${(summary.significantPositive * 100).toFixed(1)}%`}</strong>
+          <span>显著负相关（名义）</span><strong>{summary.significantNegative == null ? '—' : `${(summary.significantNegative * 100).toFixed(1)}%`}</strong>
+          <span>r 无定义格点</span><strong>{summary.undefined} / {rows * cols}</strong>
+        </div>
+      </section>}
       {/* ── 剖面图（2026-08-25 起注释停用：热力图已完整展示 r 分布，单行剖面价值有限）──
       {selectedI !== null && (
         <div className="cross-section">

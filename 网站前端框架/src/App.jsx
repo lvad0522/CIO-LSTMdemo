@@ -4,7 +4,7 @@ import ModuleSelector from './components/ModuleSelector';
 import ParamPanel from './components/ParamPanel';
 import RunButton from './components/RunButton';
 import SkillMap from './components/SkillMap';
-import TimeSeriesChart from './components/TimeSeriesChart';
+// import TimeSeriesChart from './components/TimeSeriesChart';
 import ModelCompareChart from './components/ModelCompareChart';
 import ResultsTable from './components/ResultsTable';
 import CioProjectionResult from './components/CioProjectionResult';
@@ -67,7 +67,7 @@ export default function App() {
   const [error, setError] = useState(null);
   // 时序图当前格点（默认 (40,50) 与 /api/run 默认一致；点击热力图后更新）
   // 显示顺序统一为 (经度, 纬度) = (j, i)：横轴=经度、纵轴=纬度（2026-08-25）
-  const [selectedGrid, setSelectedGrid] = useState({ i: 40, j: 50 });
+  const [, setSelectedGrid] = useState({ i: 40, j: 50 }); // 恢复时序图时同时恢复 selectedGrid。
   const [cioFile, setCioFile] = useState(null);
   // 2026-09-21：默认值由 'npy' 改为 'zip' —— 上传区的「CIO 序列 (.npy)」tab 已注释掉
   // （见 DataSelector.jsx 的 UPLOAD_KINDS）。默认值若仍为 'npy'，就没有任何 tab 处于
@@ -287,9 +287,9 @@ export default function App() {
   return (
     <div className="app">
       <aside className="sidebar">
-        <div className="logo">
-          <h1>CIO + LSTM</h1>
-          <p>季风降水预测交互展示</p>
+        <div className="logo" lang="en">
+          <h1>CIO-Rain</h1>
+          <p>East Asian Summer Monsoon Intraseasonal Rainfall Prediction</p>
         </div>
 
         <DataSelector
@@ -328,6 +328,10 @@ export default function App() {
 
         <div className="sidebar-footer">
           <p>基于 Zhou et al. (2024) GRL</p>
+          <button
+            className="intro-replay"
+            onClick={() => window.dispatchEvent(new Event('cio-rain:replay-intro'))}
+          >重播开场 · Replay intro</button>
           <p>src/src/ 代码实现</p>
         </div>
       </aside>
@@ -411,15 +415,19 @@ export default function App() {
               <div className="result-col">
                 <SkillMap
                   data={results.skillMap}
+                  sampleCount={results.timeSeries?.real?.length}
+                  confidence={params.cioSignificance}
                   region={params.predRegion}
                   onGridClick={handleGridClick}
                 />
               </div>
               <div className="result-col">
+                {/* 暂停展示降水时序对比，保留代码便于恢复。
                 <TimeSeriesChart
                   data={results.timeSeries}
                   gridLabel={`东亚 (${selectedGrid.j}, ${selectedGrid.i})`}
                 />
+                */}
                 <ModelCompareChart data={results.s2s} />
               </div>
             </div>

@@ -2,7 +2,7 @@
 """CIO 投影模块：原始场 → projected CIO 序列（完整链路的第一步）
 
 口径 = 2026-09-15 在服务器上逐点验证锁死的那条（交接文档 §9）：
-  1. 读原始逐日距平场（每月只含 2–29 日，28 天/月）
+  1. 按 NetCDF 元数据读取逐日 U850 距平，选取训练窗口内每月 2–29 日
   2. 裁剪到 -20..20N / 40..120E，双线性插值到 1°（41×81）
   3. 减"按日序 1–28 跨年"的平均场（日序 >28 无平均，按 0）—— 跨月合并
   4. 减"沿纬度"的高通项 U850_high                       ← 见下面的警告
@@ -22,11 +22,11 @@
 
 from __future__ import annotations
 
-import glob
 import os
-import re
 
 import numpy as np
+
+import u850_adapter
 
 NLAT, NLON = 41, 81                 # -20..20 / 40..120 @1°
 LAT_TGT = np.arange(-20, 21, 1.0)
@@ -71,28 +71,6 @@ def read_nc(path: str) -> dict:
     raise RuntimeError("没有库能读 %s → %s" % (path, " | ".join(errs)))
 
 
-def _pick_field(d: dict, hints=("u850", "uwnd")) -> np.ndarray:
-    best = None
-    for k, v in d.items():
-        if getattr(v, "ndim", 0) < 3 or k in ("lat", "lon", "time"):
-            continue
-        if any(h in k.lower() for h in hints):
-            return np.asarray(v, dtype=np.float64)
-        best = v if best is None else best
-    if best is None:
-        raise ValueError("nc 里找不到三维场：%s" % list(d))
-    return np.asarray(best, dtype=np.float64)
-
-
-def _orient(arr, lat, lon):
-    """保证纬度递增、经度递增。"""
-    if lat[0] > lat[-1]:
-        lat, arr = lat[::-1], arr[:, ::-1, :]
-    if lon[0] > lon[-1]:
-        lon, arr = lon[::-1], arr[:, :, ::-1]
-    return arr, lat, lon
-
-
 # ----------------------------------------------------------------- 时间窗
 
 def window(lead: int):
@@ -108,65 +86,9 @@ def in_window(month: int, day: int, lead: int) -> bool:
 
 # ----------------------------------------------------------------- 读场
 
-def find_nc_files(nc_dir: str, year: int, month: int):
-    """按月找文件：优先按官方命名，找不到再放宽正则。"""
-    pat = "*%04d%02d02-28days*" % (year, month)
-    hit = sorted(glob.glob(os.path.join(nc_dir, pat)))
-    if hit:
-        return hit[0]
-    rx = re.compile(r"\.%04d%02d\d{2}-28days" % (year, month))
-    for f in sorted(os.listdir(nc_dir)):
-        if rx.search(f) and os.path.isfile(os.path.join(nc_dir, f)):
-            return os.path.join(nc_dir, f)
-    return None
-
-
 def load_field(nc_dir: str, years, lead: int):
-    """读窗口内的原始场并插值到 1°。
-
-    返回 (U3 (41,81,T), dom (T,), rows, missing)：
-      dom  —— 每一天的"日序"（2..29），第 3 步按它取平均
-      rows —— [(年, 月, 日), ...]，对齐用
-    """
-    from scipy.interpolate import RegularGridInterpolator
-
-    lon_g, lat_g = np.meshgrid(LON_TGT, LAT_TGT)
-    pts = np.array([lat_g.ravel(), lon_g.ravel()]).T
-    seq, dom, rows, missing = [], [], [], []
-
-    for y in years:
-        for mo in MONTHS:
-            fp = find_nc_files(nc_dir, y, mo)
-            if fp is None:
-                if in_window(mo, 28, lead) or in_window(mo, 2, lead):
-                    missing.append((y, mo))
-                continue
-            d = read_nc(fp)
-            a = np.squeeze(_pick_field(d))
-            lat = np.ravel(d["lat"]) if "lat" in d else np.ravel(d["latitude"])
-            lon = np.ravel(d["lon"]) if "lon" in d else np.ravel(d["longitude"])
-            a, lat, lon = _orient(a, lat, lon)
-
-            lat_m = (lat >= -20 - 1e-6) & (lat <= 20 + 1e-6)
-            lon_m = (lon >= 40 - 1e-6) & (lon <= 120 + 1e-6)
-            sub, slat, slon = a[:, lat_m, :][:, :, lon_m], lat[lat_m], lon[lon_m]
-
-            for k in range(sub.shape[0]):
-                day = 2 + k                    # 文件里只存 2–29 日
-                if not in_window(mo, day, lead):
-                    continue
-                f = RegularGridInterpolator((slat, slon), sub[k], bounds_error=False,
-                                            fill_value=np.nan)
-                seq.append(f(pts).reshape(NLAT, NLON))
-                dom.append(day)
-                rows.append((y, mo, day))
-
-    if not seq:
-        raise RuntimeError("窗口内一天数据都没读到：nc_dir=%s lead=%d" % (nc_dir, lead))
-    U3 = np.stack(seq, axis=2)                 # (41,81,T)
-    if not np.isfinite(U3).all():
-        raise RuntimeError("插值后出现 NaN/Inf —— 源网格没覆盖 -20..20/40..120？")
-    return U3, np.array(dom, dtype=int), rows, missing
+    """Read metadata-defined daily anomalies and adapt to the trained grid/calendar."""
+    return u850_adapter.load_fields(nc_dir, years, lead)[:4]
 
 
 # ----------------------------------------------------------------- 投影
@@ -269,7 +191,10 @@ def compute_cioproj(which: str = "u850", nc_dir: str = None, years=(),
         raise ValueError("缺少 CIOmode .mat 路径（mat_path）")
 
     years = list(years)
-    U3, dom, rows, missing = load_field(nc_dir, years, lead)
+    U3, dom, rows, missing, adaptation = u850_adapter.load_fields(
+        nc_dir, years, lead, target_year=diagnostic_year,
+    )
+    years = sorted(set(row[0] for row in rows))
     consts = load_consts(mat_path)
     diagnostic_indices = None
     if diagnostic_year is not None:
@@ -289,12 +214,14 @@ def compute_cioproj(which: str = "u850", nc_dir: str = None, years=(),
     dates = ["%04d-%02d-%02d" % row for row in rows]
     meta = {"which": "u850", "lead": lead, "years": years,
             "length": int(series.size), "days_per_year": per_year,
-            "missing_months": missing, "window": window(lead), "dates": dates}
+            "missing_months": missing, "window": window(lead), "dates": dates,
+            "adaptation": adaptation}
     if diagnostic_indices is not None:
         projection_diagnostics["dates"] = [dates[index] for index in diagnostic_indices]
         projection_diagnostics["projected"] = series[diagnostic_indices]
         meta["projection_diagnostics"] = projection_diagnostics
     if missing:
-        meta["warning"] = ("缺这些月份的源文件 %s —— 窗口天数不足 112/年，"
-                           "与官方序列会有偏差" % missing)
+        meta["warning"] = ("缺少 %d 个窗口日期（涉及月份 %s），相关年份不足 112 点；"
+                           "具体日期见数据适配明细，与训练口径可能有偏差。"
+                           % (len(adaptation['missingDates']), missing))
     return series, meta

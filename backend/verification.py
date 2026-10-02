@@ -39,6 +39,11 @@ import numpy as np
 N_STEPS = 112
 GRID_ROWS = 81
 GRID_COLS = 101
+# 与导师 our_result 的蓝框口径一致。网格是 20..40°N、100..125°E，间距 0.25°。
+FOCUS_LAT = (23.0, 27.0)
+FOCUS_LON = (112.0, 121.0)
+FOCUS_ROW_SLICE = slice(12, 29)  # 23..27°N，含端点，共 17 行
+FOCUS_COL_SLICE = slice(48, 85)  # 112..121°E，含端点，共 37 列
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
@@ -143,8 +148,9 @@ def summarize(r_map: np.ndarray, confidence: float) -> dict:
     """r 图的摘要统计。只统计有定义的格点。
 
     显著性按**双尾** t 检验判 |r| ≥ 阈值，但拆成正/负两侧分别报：
-    降水技巧图上「显著正相关」才意味着该格点有技巧，「显著负相关」是反相关
-    （比气候态还差）。只报一个合计数会把这两件事混成一件。
+    降水技巧图上「显著正相关」才意味着该格点有技巧，「显著负相关」是反相关。
+    是否比气候态差需在同一误差指标下另行比较，不能由 r 单独推出。只报一个
+    合计数会把这两件事混成一件。
     """
     defined = np.isfinite(r_map)
     values = r_map[defined]
@@ -174,4 +180,66 @@ def summarize(r_map: np.ndarray, confidence: float) -> dict:
         "definedPoints": int(defined.sum()),
         "undefinedPoints": total - int(defined.sum()),
         "totalPoints": total,
+    }
+
+
+def _series_r(pred: np.ndarray, truth: np.ndarray) -> float | None:
+    """一维成对序列 Pearson r；样本不足或恒定时返回 None。"""
+    valid = np.isfinite(pred) & np.isfinite(truth)
+    a, b = pred[valid], truth[valid]
+    if a.size < 3:
+        return None
+    a = a - a.mean()
+    b = b - b.mean()
+    denominator = float(np.sqrt(np.sum(a * a) * np.sum(b * b)))
+    if not denominator > 0:
+        return None
+    return float(np.clip(np.sum(a * b) / denominator, -1.0, 1.0))
+
+
+def focus_region_summary(pred: np.ndarray, truth: np.ndarray,
+                         r_map: np.ndarray) -> dict:
+    """重点区的区域平均序列和评价，严格沿用现有蓝框的算术平均口径。
+
+    每个日期只在该日期预测和实况都有限的格点上做空间平均；随后只用两条
+    区域序列同时有限的日期计算 r/RMSE/MAE。格点 r 平均则只排除 r 无定义点。
+    """
+    pred = np.asarray(pred, dtype=np.float64)
+    truth = np.asarray(truth, dtype=np.float64)
+    r_map = np.asarray(r_map, dtype=np.float64)
+    if pred.shape != truth.shape or pred.shape != (GRID_ROWS, GRID_COLS, N_STEPS):
+        raise ValueError(f"重点区评价需要同形 (81,101,112) 场，收到 {pred.shape}/{truth.shape}")
+    if r_map.shape != (GRID_ROWS, GRID_COLS):
+        raise ValueError(f"重点区 r 图应为 (81,101)，收到 {r_map.shape}")
+
+    p = pred[FOCUS_ROW_SLICE, FOCUS_COL_SLICE, :]
+    t = truth[FOCUS_ROW_SLICE, FOCUS_COL_SLICE, :]
+    paired = np.isfinite(p) & np.isfinite(t)
+    counts = paired.sum(axis=(0, 1))
+    p_sum = np.where(paired, p, 0.0).sum(axis=(0, 1))
+    t_sum = np.where(paired, t, 0.0).sum(axis=(0, 1))
+    p_series = np.divide(p_sum, counts, out=np.full(N_STEPS, np.nan), where=counts > 0)
+    t_series = np.divide(t_sum, counts, out=np.full(N_STEPS, np.nan), where=counts > 0)
+    valid_days = np.isfinite(p_series) & np.isfinite(t_series)
+    errors = p_series[valid_days] - t_series[valid_days]
+    roi_r = r_map[FOCUS_ROW_SLICE, FOCUS_COL_SLICE]
+    defined_r = roi_r[np.isfinite(roi_r)]
+
+    def nullable(values):
+        return [None if not np.isfinite(value) else float(value) for value in values]
+
+    return {
+        "region": {
+            "lon": list(FOCUS_LON), "lat": list(FOCUS_LAT),
+            "aggregation": "arithmetic-mean", "gridPoints": int(p.shape[0] * p.shape[1]),
+        },
+        "pred": nullable(p_series),
+        "truth": nullable(t_series),
+        "pairedDays": int(valid_days.sum()),
+        "seriesR": _series_r(p_series, t_series),
+        "rmse": None if errors.size == 0 else float(np.sqrt(np.mean(errors * errors))),
+        "mae": None if errors.size == 0 else float(np.mean(np.abs(errors))),
+        "meanPointR": None if defined_r.size == 0 else float(defined_r.mean()),
+        "definedPointR": int(defined_r.size),
+        "undefinedPointR": int(roi_r.size - defined_r.size),
     }

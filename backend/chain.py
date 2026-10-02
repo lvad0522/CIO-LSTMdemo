@@ -28,6 +28,7 @@ router，前缀 `/api/chain`。它**不重新实现任何口径**，只做编排
 
 from __future__ import annotations
 
+import csv
 import io
 import os
 import shutil
@@ -46,6 +47,7 @@ import cioproj
 import cio_diagnostics as diagnostics
 import live_prediction as prediction
 import verification
+import u850_adapter
 
 
 router = APIRouter(prefix="/api/chain", tags=["prediction-chain"])
@@ -427,36 +429,31 @@ def _zip_months_by_year(zip_path: Path) -> dict[int, list[int]]:
 
 def _intake_zip(content: bytes, job_dir: Path, which: str, filename: str,
                 year: int, lead: int) -> dict:
-    """`.zip` 受理：全程 O(1) 级校验（解压与投影留在后台）。"""
+    """Extract safely and validate metadata/date coverage before scheduling projection."""
     zip_path = job_dir / "raw_fields.zip"
     zip_path.write_bytes(content)          # 只写这一份，不再另存 bytes（design R12）
 
-    kind, kind_source = _resolve_zip_kind(which, filename)
+    # Metadata is authoritative for anonymous archive names; do not guess from
+    # a ZIP's label. Explicit SST/combined requests retain the existing errors.
+    requested = (which or '').strip().lower()
+    if requested in ('', 'auto'):
+        try:
+            kind, kind_source = _resolve_zip_kind(which, filename)
+        except HTTPException as exc:
+            if '判不出' not in str(exc.detail):
+                raise
+            kind, kind_source = 'u850', 'netcdf-metadata'
+    else:
+        kind, kind_source = _resolve_zip_kind(which, filename)
     identity = _mat_identity(required=True)
-    label = f"pre{lead}/{year}"
-
     try:
-        years = prediction._zip_years(zip_path)
+        raw_dir = job_dir / 'raw'
+        extracted = prediction._safe_extract_nc(zip_path, raw_dir)
+        entries = u850_adapter.inventory(raw_dir)
+        years = sorted({d.year for _, spec in entries for d in spec['dates']})
+        u850_adapter.require_window(entries, year, lead)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    if year not in years:
-        raise HTTPException(
-            400,
-            f"zip 里没有 {year} 年的 nc（现有年份 {years[0]}–{years[-1]}）；"
-            f"模型 {label} 需要该年作为预测目标年。",
-        )
-
-    # 目标年必须齐 5–9 月：缺月 ⇒ 窗口必然不足 112 天，**早 400**比跑完投影再失败
-    # 好得多。这里只判"文件在不在"（必要条件）；充分性由阶段② 的真实
-    # `days_per_year` 兜底（design D8 的权威判据）。**前序年缺月不拒**，只警告。
-    have = _zip_months_by_year(zip_path).get(year, [])
-    missing = [month for month in cioproj.MONTHS if month not in have]
-    if missing:
-        raise HTTPException(
-            400,
-            f"{label}：zip 里 {year} 年缺 {missing} 月的 nc，"
-            f"摘不出 {prediction.N_STEPS} 天窗口。",
-        )
 
     return {
         "inputKind": "raw-zip",
@@ -466,6 +463,8 @@ def _intake_zip(content: bytes, job_dir: Path, which: str, filename: str,
         "lead": lead,
         "year": year,
         "years": years,
+        "extractedFiles": extracted,
+        "metadataValidated": True,
         "window": cioproj.window(lead),
         **identity,
     }
@@ -532,10 +531,12 @@ def _run_zip_stage1(job_id: str, job_dir: Path, projection: dict, lead: int,
 
     report(5, "正在解压原始气象场")
     raw_dir = job_dir / "raw"
-    extracted = prediction._safe_extract_nc(zip_path, raw_dir)
-    nc_dir = prediction._locate_nc_dir(raw_dir)
+    extracted = projection.get('extractedFiles')
+    if not projection.get('metadataValidated'):
+        extracted = prediction._safe_extract_nc(zip_path, raw_dir)
+    nc_dir = raw_dir
 
-    report(20, f"正在投影 CIO（{len(years)} 年 × 5 月，{extracted} 个 nc）")
+    report(20, f"正在按真实日期适配并投影 CIO（{len(years)} 年，{extracted} 个 NetCDF）")
     series, meta = cioproj.compute_cioproj(
         which=kind,
         nc_dir=str(nc_dir),
@@ -572,6 +573,8 @@ def _run_zip_stage1(job_id: str, job_dir: Path, projection: dict, lead: int,
         projected=preview_data["projected"],
     )
     diagnostics._write_json(_dates_path(job_dir), dates)
+    if meta.get('adaptation'):
+        diagnostics._write_json(job_dir / 'adaptation.json', meta['adaptation'])
     diagnostics._write_json(
         _completeness_path(job_dir), diagnostics._zip_completeness(meta)
     )
@@ -582,6 +585,7 @@ def _run_zip_stage1(job_id: str, job_dir: Path, projection: dict, lead: int,
         "years": meta.get("years", years),
         "daysPerYear": meta.get("days_per_year"),
         "missingMonths": meta.get("missing_months"),
+        "adaptation": meta.get("adaptation"),
     }
     _advance(
         job_id, 1,
@@ -1270,6 +1274,53 @@ def chain_pearson(job_id: str, confidence: float = Query(0.95)):
             for row in r_map
         ],
     }
+
+
+def _focus_region_dates(job_id: str, job: dict) -> list[str]:
+    """与 CIO 目标窗口卡同源地给重点区序列配日期标签。"""
+    job_dir = _job_dir(job)
+    raw = np.load(_series_path(job_dir), allow_pickle=False)
+    dates_path = _dates_path(job_dir)
+    dates = diagnostics._read_json(dates_path) if dates_path.is_file() else None
+    target = _target_window(job_id, job, raw, dates)
+    if target.get("available") and target.get("dates"):
+        return [str(value) for value in target["dates"]]
+    if target.get("available") and target.get("monthDay"):
+        return [f"{month:02d}-{day:02d}" for month, day in target["monthDay"]]
+    return [f"第 {index + 1} 天" for index in range(prediction.N_STEPS)]
+
+
+@router.get("/jobs/{job_id}/focus-region")
+def chain_focus_region(job_id: str):
+    """本次任务重点区评价；不复用历史 S2S 或缓存结果。"""
+    job, path = _require_prediction(job_id)
+    meta = (job.get("result") or {}).get("verification") or {}
+    truth_path = job.get("truthFile")
+    if not meta.get("available") or not truth_path or not Path(truth_path).is_file():
+        raise HTTPException(409, meta.get("reason") or "该任务没有可用的实况场对比结果")
+    pred = np.load(path, mmap_mode="r", allow_pickle=False)
+    truth = np.load(truth_path, mmap_mode="r", allow_pickle=False)
+    r_path = _pearson_path(path.parent)
+    if not r_path.is_file():
+        raise HTTPException(404, "相关系数图产物不存在")
+    payload = verification.focus_region_summary(pred, truth, np.load(r_path, mmap_mode="r", allow_pickle=False))
+    payload.update({"dates": _focus_region_dates(job_id, job), "truthName": meta.get("truthName")})
+    return payload
+
+
+@router.get("/jobs/{job_id}/download/focus-region")
+def download_focus_region(job_id: str):
+    """下载本次任务重点区逐日预测/实况序列，供论文复算。"""
+    payload = chain_focus_region(job_id)
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["date", "region_mean_prediction_mm_per_day", "region_mean_truth_mm_per_day"])
+    writer.writerows(zip(payload["dates"], payload["pred"], payload["truth"]))
+    lead, year = _job_combo(_get_job(job_id))
+    return StreamingResponse(
+        iter(["\ufeff" + output.getvalue()]), media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="focus_region_{lead}_{year}.csv"'},
+    )
 
 
 def _job_combo(job: dict) -> tuple[str, int]:

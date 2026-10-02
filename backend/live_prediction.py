@@ -629,7 +629,7 @@ def _safe_extract_nc(zip_path: Path, dest: Path) -> int:
     with zipfile.ZipFile(zip_path) as zf:
         members = [
             m for m in zf.infolist()
-            if not m.is_dir() and m.filename.lower().endswith(".nc")
+            if not m.is_dir() and m.filename.lower().endswith((".nc", ".nc4"))
         ]
         if not members:
             raise ValueError("zip 里没有 .nc 文件（应打包 5–9 月的逐日原始场）")

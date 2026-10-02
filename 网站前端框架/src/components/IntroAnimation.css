@@ -1,0 +1,83 @@
+.intro-animation {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: radial-gradient(ellipse at 30% 46%, #102a3b 0%, #0a1c29 43%, #071521 100%);
+  color: #f5f2e7;
+  --globe-opacity: 0;
+  --brand-opacity: 0;
+  --brand-offset: 12px;
+  --subtitle-opacity: 0;
+}
+.intro-composition {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  align-items: center;
+  gap: clamp(20px, 4vw, 70px);
+  width: min(1400px, 94vw);
+}
+.intro-globe { opacity: var(--globe-opacity); }
+.intro-globe canvas { display: block; width: 100%; aspect-ratio: 1; }
+.intro-wordmark { text-align: center; padding-right: 2vw; }
+.intro-wordmark h1 {
+  font-family: "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
+  font-weight: 400;
+  font-size: clamp(48px, 7.7vw, 122px);
+  line-height: 1.1;
+  letter-spacing: -.035em;
+  white-space: nowrap;
+  opacity: var(--brand-opacity);
+  transform: translateY(var(--brand-offset));
+}
+.intro-wordmark p {
+  margin-top: clamp(18px, 2vw, 34px);
+  font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  font-size: clamp(15px, 1.75vw, 28px);
+  line-height: 1.5;
+  font-weight: 300;
+  letter-spacing: .035em;
+  color: #aecad3;
+  opacity: var(--subtitle-opacity);
+}
+.intro-wordmark p span { display: block; }
+.intro-skip {
+  position: absolute;
+  right: clamp(20px, 3vw, 52px);
+  bottom: clamp(20px, 3vw, 45px);
+  border: 0;
+  background: transparent;
+  padding: 10px 12px;
+  color: #9bb8c4;
+  font: 400 14px "Segoe UI", sans-serif;
+  letter-spacing: .03em;
+  cursor: pointer;
+}
+.intro-skip span { margin-left: 8px; }
+.intro-skip:hover { color: #eef5f5; }
+.intro-skip:focus-visible { outline: 1px solid #8cb9c7; outline-offset: 4px; border-radius: 4px; }
+.intro-replay {
+  display: block;
+  margin-top: 12px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: #a4c8ce;
+  font: inherit;
+  cursor: pointer;
+}
+.intro-replay:hover { color: #e2f0f1; }
+.intro-replay:focus-visible { outline: 1px solid #8cb9c7; outline-offset: 3px; }
+@media (max-width: 650px), (max-aspect-ratio: 4/5) {
+  .intro-composition { grid-template-columns: 1fr; gap: 0; width: min(480px, 86vw); }
+  .intro-globe { width: min(64vw, 42vh); justify-self: center; }
+  .intro-wordmark { padding: 0; }
+  .intro-wordmark h1 { font-size: clamp(45px, 12vw, 72px); }
+  .intro-wordmark p { font-size: clamp(14px, 3.5vw, 18px); margin-top: 18px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .intro-animation { display: none; }
+  .intro-replay { display: none; }
+}

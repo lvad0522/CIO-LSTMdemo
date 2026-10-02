@@ -10,6 +10,8 @@ const GEO_URL = '/geo/east_asia_coastline.json?v=1';
 const MAP_ROWS = 81;
 const MAP_COLS = 101;
 const CONTOUR_LEVEL = 0.5;
+// 所有任务、所有日期共用此误差色标；超出范围的数值仅在颜色上饱和。
+const ERROR_COLOR_LIMIT = 50;
 
 const KIND_LABELS = { u850: 'U850 距平场', sst: 'SST', both: 'SST + U850' };
 const KIND_SOURCE_LABELS = { 'explicit-param': '界面指定', filename: '按文件名判定' };
@@ -18,16 +20,6 @@ const NORM_LABELS = {
   'extended-base': '扩展归一化基准（覆盖目标年份，见警告）',
   partial: '整段自归一化（短序列，见警告）',
 };
-
-function precipColor(value, maxAbs) {
-  const t = Math.max(-1, Math.min(1, value / Math.max(maxAbs, 1e-6)));
-  if (t >= 0) {
-    const fade = Math.round(255 * (1 - t));
-    return `rgb(220, ${fade}, ${fade})`;
-  }
-  const fade = Math.round(255 * (1 + t));
-  return `rgb(${fade}, ${fade}, 220)`;
-}
 
 // 旧版 Pearson 蓝-白-红色标保留作对照，当前不启用：
 // function rColor(value) {
@@ -39,6 +31,7 @@ function precipColor(value, maxAbs) {
 const VIEW_LABELS = {
   prediction: '预测场',
   truth: '实况场',
+  error: '误差图',
 };
 
 function contourPathD(grid, threshold) {
@@ -119,7 +112,7 @@ function focusBox(rows, cols) {
   return { x, y, width: right - x, height: bottom - y };
 }
 
-function GeoHeatmapFrame({ children, data, rows, cols, geoData, selectedPoint = null }) {
+function GeoHeatmapFrame({ children, data, rows, cols, geoData, selectedPoint = null, contourLabel = '0.5 mm/天 等值线', showContour = true }) {
   const box = focusBox(rows, cols);
   return (
     <div className="prediction-map-shell">
@@ -152,6 +145,7 @@ function GeoHeatmapFrame({ children, data, rows, cols, geoData, selectedPoint = 
                 vectorEffect="non-scaling-stroke"
               />
             )}
+            {showContour && (
             <path
               d={contourPathD(data, CONTOUR_LEVEL)}
               fill="none"
@@ -160,6 +154,7 @@ function GeoHeatmapFrame({ children, data, rows, cols, geoData, selectedPoint = 
               opacity={0.95}
               vectorEffect="non-scaling-stroke"
             />
+            )}
             <rect
               x={box.x}
               y={box.y}
@@ -192,7 +187,7 @@ function GeoHeatmapFrame({ children, data, rows, cols, geoData, selectedPoint = 
         <span className="lon-title">经度 (°E)</span>
       </div>
       <div className="geo-overlay-key">
-        <span className="geo-key-line geo-key-contour" />0.5 等值线
+        {showContour && <><span className="geo-key-line geo-key-contour" />{contourLabel}</>}
         <span className="geo-key-line geo-key-focus" />重点区域（112–121°E，23–27°N）
       </div>
     </div>
@@ -201,11 +196,10 @@ function GeoHeatmapFrame({ children, data, rows, cols, geoData, selectedPoint = 
 
 export default function LivePredictionResult({ job, confidence = '0.95' }) {
   const [timeIndex, setTimeIndex] = useState(0);
-  const [frame, setFrame] = useState(null);
-  const [view, setView] = useState('prediction');
-  const [selectedGrid, setSelectedGrid] = useState({ i: 40, j: 50 });
-  const [gridSeries, setGridSeries] = useState(null);
+  const [loadedFrame, setFrame] = useState(null);
+  const [preferredView, setView] = useState('prediction');
   const [pearson, setPearson] = useState(null);
+  const [focusRegion, setFocusRegion] = useState(null);
   const [selectedPearsonGrid, setSelectedPearsonGrid] = useState(null);
   const [geoData, setGeoData] = useState(null);
   const [error, setError] = useState(null);
@@ -214,6 +208,9 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
 
   const verification = job.result?.verification;
   const pearsonAvailable = Boolean(verification?.available);
+  const view = pearsonAvailable ? preferredView : 'prediction';
+  const frame = loadedFrame?.jobId === job.jobId && loadedFrame?.view === view
+    && loadedFrame?.timeIndex === timeIndex ? loadedFrame : null;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -229,24 +226,43 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
     return () => controller.abort();
   }, []);
 
-  // 预测场 / 实况场共用同一套画布与坐标，只是数据源不同
+  // 误差取同一任务、同一时间步的预测减实况，沿用原始网格顺序。
   useEffect(() => {
     const controller = new AbortController();
-    const path = view === 'truth'
-      ? `${API_BASE}/api/chain/jobs/${job.jobId}/truth/preview`
-      : `${API_BASE}/api/chain/jobs/${job.jobId}/preview`;
-    fetch(`${path}?time_index=${timeIndex}`, { signal: controller.signal })
-      .then(async (res) => {
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || `场读取失败 (${res.status})`);
-        return data;
-      })
-      .then(setFrame)
-      .catch((err) => {
-        if (err.name !== 'AbortError') setError(err.message);
-      });
+    if (view !== 'prediction' && !pearsonAvailable) return undefined;
+    const base = `${API_BASE}/api/chain/jobs/${job.jobId}`;
+    const readFrame = async (path) => {
+      const res = await fetch(`${base}${path}?time_index=${timeIndex}`, { signal: controller.signal });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `场读取失败 (${res.status})`);
+      return data;
+    };
+    const load = async () => {
+      let data;
+      if (view === 'error') {
+        const [pred, truth] = await Promise.all([readFrame('/preview'), readFrame('/truth/preview')]);
+        if (pred.rows !== truth.rows || pred.cols !== truth.cols
+          || pred.timeIndex !== truth.timeIndex) throw new Error('预测与实况网格或日期不匹配');
+        const values = pred.data.map((row, i) => row.map((value, j) => (
+          Number.isFinite(value) && Number.isFinite(truth.data[i]?.[j])
+            ? value - truth.data[i][j] : null
+        )));
+        const finite = values.flat().filter(Number.isFinite);
+        if (!finite.length) throw new Error('当前日期没有有效的预测与实况配对数据');
+        data = { ...pred, data: values, min: Math.min(...finite), max: Math.max(...finite) };
+      } else {
+        data = await readFrame(view === 'truth' ? '/truth/preview' : '/preview');
+      }
+      if (!controller.signal.aborted) {
+        setFrame({ ...data, jobId: job.jobId, view });
+        setError(null);
+      }
+    };
+    load().catch(err => {
+      if (err.name !== 'AbortError') setError(err.message);
+    });
     return () => controller.abort();
-  }, [job.jobId, timeIndex, view]);
+  }, [job.jobId, timeIndex, view, pearsonAvailable]);
 
   // r 图与置信水平无关，只有阈值随 confidence 变 —— 每次改档位向后端要一次摘要
   useEffect(() => {
@@ -268,24 +284,28 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
   }, [job.jobId, confidence, pearsonAvailable]);
 
   useEffect(() => {
+    if (!pearsonAvailable) return undefined;
     const controller = new AbortController();
-    fetch(`${API_BASE}/api/chain/jobs/${job.jobId}/grid?i=${selectedGrid.i}&j=${selectedGrid.j}`, {
-      signal: controller.signal,
-    })
+    fetch(`${API_BASE}/api/chain/jobs/${job.jobId}/focus-region`, { signal: controller.signal })
       .then(async (res) => {
         const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || `格点序列读取失败 (${res.status})`);
+        if (!res.ok) throw new Error(data.detail || `重点区域评价读取失败 (${res.status})`);
         return data;
       })
-      .then(setGridSeries)
+      .then(data => setFocusRegion({ jobId: job.jobId, data }))
       .catch((err) => {
         if (err.name !== 'AbortError') setError(err.message);
       });
     return () => controller.abort();
-  }, [job.jobId, selectedGrid]);
+  }, [job.jobId, pearsonAvailable]);
 
   useEffect(() => {
-    if (!frame || !canvasRef.current) return;
+    if (!canvasRef.current) return;
+    if (!frame) {
+      const canvas = canvasRef.current;
+      canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
     const canvas = canvasRef.current;
     canvas.width = frame.cols * CELL_SCALE;
     canvas.height = frame.rows * CELL_SCALE;
@@ -293,7 +313,9 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
     const maxAbs = Math.max(Math.abs(frame.min), Math.abs(frame.max), 1e-6);
     frame.data.forEach((row, i) => {
       row.forEach((value, j) => {
-        ctx.fillStyle = precipColor(value, maxAbs);
+        ctx.fillStyle = Number.isFinite(value)
+          ? getHeatColor(value, -(view === 'error' ? ERROR_COLOR_LIMIT : maxAbs), view === 'error' ? ERROR_COLOR_LIMIT : maxAbs)
+          : '#2b2b2b';
         ctx.fillRect(
           j * CELL_SCALE,
           (frame.rows - 1 - i) * CELL_SCALE,
@@ -302,15 +324,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
         );
       });
     });
-    ctx.strokeStyle = '#111';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(
-      selectedGrid.j * CELL_SCALE + 0.5,
-      (frame.rows - 1 - selectedGrid.i) * CELL_SCALE + 0.5,
-      CELL_SCALE - 1,
-      CELL_SCALE - 1,
-    );
-  }, [frame, selectedGrid]);
+  }, [frame, view]);
 
   // r 图直接按相关系数上色；显著性阈值只保留在摘要统计中，不改变热力图颜色。
   useEffect(() => {
@@ -334,18 +348,6 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
     });
   }, [pearson]);
 
-  const handleCanvasClick = (event) => {
-    if (!frame) return;
-    const rect = event.currentTarget.getBoundingClientRect();
-    const j = Math.min(frame.cols - 1, Math.floor((event.clientX - rect.left) / rect.width * frame.cols));
-    const displayRow = Math.min(
-      frame.rows - 1,
-      Math.floor((event.clientY - rect.top) / rect.height * frame.rows),
-    );
-    const i = frame.rows - 1 - displayRow;
-    setSelectedGrid({ i, j });
-  };
-
   const handlePearsonCanvasClick = (event) => {
     if (!pearson) return;
     const rect = event.currentTarget.getBoundingClientRect();
@@ -359,15 +361,15 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
     );
     const i = pearson.rows - 1 - displayRow;
     setSelectedPearsonGrid({ i, j });
-    setSelectedGrid({ i, j });
   };
 
-  const chartData = (gridSeries?.pred || []).map((value, index) => ({
+  const focus = focusRegion?.jobId === job.jobId ? focusRegion.data : null;
+  const focusChartData = (focus?.pred || []).map((value, index) => ({
     day: index + 1,
+    date: focus?.dates?.[index] || `第 ${index + 1} 天`,
     prediction: value,
-    truth: gridSeries?.truth?.[index] ?? null,
+    truth: focus?.truth?.[index] ?? null,
   }));
-  const hasTruthSeries = Array.isArray(gridSeries?.truth);
   const result = job.result || {};
 
   const projection = job.projection || {};
@@ -412,17 +414,17 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
           <div className="result-card">
             <div className="result-header">
               <h3 className="result-title" style={{ margin: 0 }}>
-                {view === 'truth' ? '实况降水距平场' : '真实模型预测降水场'}
+                {view === 'error' ? '降水距平误差场' : view === 'truth' ? '实况降水距平场' : '真实模型预测降水距平场'}
               </h3>
               <div className="view-toggle">
-                {['prediction', 'truth'].map(kind => (
+                {['prediction', 'truth', 'error'].map(kind => (
                   <button
                     key={kind}
                     type="button"
                     className={`view-toggle-btn ${view === kind ? 'is-active' : ''}`}
                     onClick={() => setView(kind)}
-                    disabled={kind === 'truth' && !pearsonAvailable}
-                    title={kind === 'truth' && !pearsonAvailable
+                    disabled={kind !== 'prediction' && !pearsonAvailable}
+                    title={kind !== 'prediction' && !pearsonAvailable
                       ? '本次任务没有匹配到实况场'
                       : undefined}
                   >
@@ -433,9 +435,11 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
             </div>
             <p className="metric-note">
               时间步 {timeIndex + 1}/112 · 当前场范围 {frame ? `${frame.min.toFixed(3)} ～ ${frame.max.toFixed(3)}` : '加载中'}
-              {view === 'truth' && pearson?.truthName ? ` · ${pearson.truthName}` : ''}
+              {view !== 'prediction' && pearson?.truthName ? ` · ${pearson.truthName}` : ''}
             </p>
-            {view === 'truth' ? (
+            {view === 'error' ? (
+              <p className="chart-note">误差 = 预测 − 实况（mm/天）；红色表示高估，蓝色表示低估，白色接近零。所有日期固定色标 −50～50 mm/天，超出范围以端点颜色显示。</p>
+            ) : view === 'truth' ? (
               <p className="chart-note">
                 实况是 TRMM 观测，预测是模型输出，<strong>两者色标各自按当前帧的极值归一化</strong>，
                 所以并排看时颜色深浅不能直接对比，只能比空间形态；定量比较看下方的相关系数图。
@@ -446,16 +450,20 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
               rows={frame?.rows || MAP_ROWS}
               cols={frame?.cols || MAP_COLS}
               geoData={geoData}
+              showContour={view !== 'error'}
             >
               <canvas
                 ref={canvasRef}
                 className="prediction-canvas"
-                onClick={handleCanvasClick}
-                title="点击格点查看预测时序"
+                title={view === 'error' ? '预测 − 实况，单位 mm/天' : '降水距平，单位 mm/天'}
               />
             </GeoHeatmapFrame>
             <div className="prediction-legend">
-              <span>负距平</span><div className="prediction-gradient" /><span>正距平</span>
+              <span>{view === 'error' ? `低估 −${ERROR_COLOR_LIMIT}` : `负距平 ${frame ? (-Math.max(Math.abs(frame.min), Math.abs(frame.max))).toFixed(2) : '—'}`}</span>
+              <div className={view === 'error' ? 'error-gradient' : 'prediction-gradient'}>
+                {view === 'error' && <span className="error-gradient-zero">0</span>}
+              </div>
+              <span>{view === 'error' ? `高估 +${ERROR_COLOR_LIMIT}` : `正距平 ${frame ? Math.max(Math.abs(frame.min), Math.abs(frame.max)).toFixed(2) : '—'}`} mm/天</span>
             </div>
             <label className="prediction-slider-label">
               预测时间步
@@ -471,6 +479,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
         </div>
 
         <div className="result-col">
+          {/* 格点预测与实况时序图暂时停用；重点区域评价统一展示在下方。
           <div className="result-card">
             <h3 className="result-title">
               {hasTruthSeries ? '格点预测与实况时序' : '格点预测时序'}
@@ -504,9 +513,62 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
               </LineChart>
             </ResponsiveContainer>
           </div>
+          */}
+
+          {focus && (
+            <div className="result-card">
+              <h3 className="result-title">重点区域预测与实况</h3>
+              <p className="metric-note">
+                {focus.region.lon[0]}–{focus.region.lon[1]}°E，{focus.region.lat[0]}–{focus.region.lat[1]}°N
+                {' · '}区域内 {focus.region.gridPoints} 个格点按现有蓝框口径作算术平均
+                {' · '}有效日期 {focus.pairedDays}/112
+              </p>
+              <ResponsiveContainer width="100%" height={250}>
+                <LineChart data={focusChartData}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="day" label={{ value: '时间步', position: 'insideBottom', offset: -5 }} fontSize={11} />
+                  <YAxis label={{ value: '区域平均降水距平 (mm/天)', angle: -90, position: 'insideLeft' }} fontSize={11} />
+                  <Tooltip labelFormatter={(_, entries) => entries?.[0]?.payload?.date || '—'} formatter={(value) => (value == null ? '—' : Number(value).toFixed(4))} />
+                  <Legend />
+                  <Line type="monotone" dataKey="truth" name="区域平均实况" stroke="#1a478a" dot={false} strokeWidth={2} />
+                  <Line type="monotone" dataKey="prediction" name="区域平均预测" stroke="#e63946" dot={false} strokeWidth={2} strokeDasharray="4 2" />
+                </LineChart>
+              </ResponsiveContainer>
+              <div className="focus-evaluation-groups">
+                <section className="focus-evaluation-group">
+                  <h4>区域平均序列评价</h4>
+                  <div className="focus-metrics">
+                    {[
+                      ['Pearson r', focus.seriesR, ''],
+                      ['RMSE', focus.rmse, 'mm/天'],
+                      ['MAE', focus.mae, 'mm/天'],
+                    ].map(([label, value, unit]) => (
+                      <div className="focus-metric" key={label}>
+                        <span>{label}</span>
+                        <strong>{value == null ? '无定义' : value.toFixed(4)}</strong>
+                        {unit && <small>{unit}</small>}
+                      </div>
+                    ))}
+                  </div>
+                </section>
+                <section className="focus-evaluation-group">
+                  <h4>区域内格点评价</h4>
+                  <div className="prediction-summary">
+                    <span>逐格点 r 平均</span><strong>{focus.meanPointR == null ? '无定义' : focus.meanPointR.toFixed(4)}</strong>
+                    <span>r 有定义格点</span><strong>{focus.definedPointR} / {focus.definedPointR + focus.undefinedPointR}</strong>
+                  </div>
+                </section>
+              </div>
+              <p className="chart-note">序列指标对应上方区域平均预测与实况；格点指标评价区域内部各格点的时间相关性。</p>
+              <a className="download-prediction-btn" href={`${API_BASE}/api/chain/jobs/${job.jobId}/download/focus-region`} download>
+                下载重点区域逐日序列 CSV
+              </a>
+            </div>
+          )}
 
           <div className="result-card">
-            <h3 className="result-title">模型运行摘要</h3>
+            <details className="model-run-details">
+            <summary className="result-title">模型运行摘要与数据下载</summary>
             <div className="prediction-summary">
               {metaRows.map(([label, value]) => (
                 <Fragment key={label}>
@@ -538,6 +600,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
             >
               下载 prediction_{downloadCombo}.npy
             </a>
+            </details>
           </div>
         </div>
       </div>
@@ -565,15 +628,17 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
               </div>
               <p className="metric-note">
                 {pearson
-                  ? `每个格点沿 112 天算一个 r · 通过 ${(pearson.confidence * 100).toFixed(0)}% 显著性需 |r| ≥ ${pearson.criticalR}`
+                  ? `每个格点沿 112 天算一个 r · 名义 ${(pearson.confidence * 100).toFixed(0)}% 阈值需 |r| ≥ ${pearson.criticalR}`
                   : '正在计算相关系数'}
               </p>
+              <p className="chart-note">双侧 t 检验；暂未校正时间自相关及多格点比较。</p>
               <GeoHeatmapFrame
                 data={pearson?.data}
                 rows={pearson?.rows || MAP_ROWS}
                 cols={pearson?.cols || MAP_COLS}
                 geoData={geoData}
                 selectedPoint={selectedPearsonGrid}
+                contourLabel="r = 0.5 等值线"
               >
                 <canvas
                   ref={rCanvasRef}
@@ -635,7 +700,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
               <p className="chart-note">
                 降水距平场空间上很不均匀，展平成一个数会被大值区主导，所以按实验室口径取
                 <strong>逐格点沿时间维</strong>的 r（`pearson2.npy` 第 3 通道就是这个量）。
-                显著负相关表示该格点比气候态还差，不是技巧，故与显著正相关分开计。
+                显著负相关表示预测与实况变化方向相反，故与显著正相关分开计。
               </p>
               {pearson?.downloadUrl && (
                 <a
