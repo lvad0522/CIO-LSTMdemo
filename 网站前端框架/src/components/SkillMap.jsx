@@ -353,7 +353,7 @@ export default function SkillMap({ data, region, onGridClick, sampleCount, confi
           <div className="pearson-point-readout" role="status">
             <span>已选格点</span>
             <strong>{(100 + point.j * 25 / (cols - 1)).toFixed(2)}°E，{(20 + point.i * 20 / (rows - 1)).toFixed(2)}°N</strong>
-            <span>Pearson 系数</span><strong>{finite ? `r = ${value.toFixed(4)}` : 'r 无定义'}</strong>
+            <span>Pearson 系数</span><strong>{finite ? `r = ${value}` : 'r 无定义'}</strong>
             <span className={`pearson-point-status ${significant ? 'is-significant' : ''}`}>
               {!finite ? '该格点 r 无定义' : criticalR == null ? '暂无显著性阈值' : significant ? '达到当前显著性阈值' : '未达到当前显著性阈值'}
             </span>
@@ -364,9 +364,9 @@ export default function SkillMap({ data, region, onGridClick, sampleCount, confi
       {summary && <section className="focus-evaluation-group" style={{ marginTop: 16 }}>
         <h4>技巧摘要</h4>
         <div className="prediction-summary">
-          <span>平均相关系数</span><strong>{summary.mean.toFixed(4)}</strong>
-          <span>中位数</span><strong>{summary.median.toFixed(4)}</strong>
-          <span>范围</span><strong>{summary.min.toFixed(3)} ～ {summary.max.toFixed(3)}</strong>
+          <span>平均相关系数</span><strong>{summary.mean}</strong>
+          <span>中位数</span><strong>{summary.median}</strong>
+          <span>范围</span><strong>{summary.min} ～ {summary.max}</strong>
           <span>正相关格点</span><strong>{(summary.positive * 100).toFixed(1)}%</strong>
           <span>显著正相关（名义）</span><strong>{summary.significantPositive == null ? '—' : `${(summary.significantPositive * 100).toFixed(1)}%`}</strong>
           <span>显著负相关（名义）</span><strong>{summary.significantNegative == null ? '—' : `${(summary.significantNegative * 100).toFixed(1)}%`}</strong>

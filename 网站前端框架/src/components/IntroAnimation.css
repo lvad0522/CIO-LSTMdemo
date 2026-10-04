@@ -25,7 +25,7 @@
 .intro-wordmark h1 {
   font-family: "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
   font-weight: 400;
-  font-size: clamp(48px, 7.7vw, 122px);
+  font-size: clamp(36px, 6vw, 96px);
   line-height: 1.1;
   letter-spacing: -.035em;
   white-space: nowrap;
@@ -74,7 +74,7 @@
   .intro-composition { grid-template-columns: 1fr; gap: 0; width: min(480px, 86vw); }
   .intro-globe { width: min(64vw, 42vh); justify-self: center; }
   .intro-wordmark { padding: 0; }
-  .intro-wordmark h1 { font-size: clamp(45px, 12vw, 72px); }
+  .intro-wordmark h1 { font-size: clamp(32px, 9.5vw, 56px); }
   .intro-wordmark p { font-size: clamp(14px, 3.5vw, 18px); margin-top: 18px; }
 }
 @media (prefers-reduced-motion: reduce) {

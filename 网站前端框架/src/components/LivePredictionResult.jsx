@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from 'react';
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
 import { getHeatColor } from '../utils/heatColor';
 
@@ -194,7 +194,7 @@ function GeoHeatmapFrame({ children, data, rows, cols, geoData, selectedPoint = 
   );
 }
 
-export default function LivePredictionResult({ job, confidence = '0.95' }) {
+export default function LivePredictionResult({ job, confidence = '0.95', apiRoot, showSkill = true, showRunSummary = true, children }) {
   const [timeIndex, setTimeIndex] = useState(0);
   const [loadedFrame, setFrame] = useState(null);
   const [preferredView, setView] = useState('prediction');
@@ -206,6 +206,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
   const canvasRef = useRef(null);
   const rCanvasRef = useRef(null);
 
+  const root = apiRoot || `${API_BASE}/api/chain/jobs/${job.jobId}`;
   const verification = job.result?.verification;
   const pearsonAvailable = Boolean(verification?.available);
   const view = pearsonAvailable ? preferredView : 'prediction';
@@ -230,7 +231,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
   useEffect(() => {
     const controller = new AbortController();
     if (view !== 'prediction' && !pearsonAvailable) return undefined;
-    const base = `${API_BASE}/api/chain/jobs/${job.jobId}`;
+    const base = root;
     const readFrame = async (path) => {
       const res = await fetch(`${base}${path}?time_index=${timeIndex}`, { signal: controller.signal });
       const data = await res.json();
@@ -262,13 +263,13 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
       if (err.name !== 'AbortError') setError(err.message);
     });
     return () => controller.abort();
-  }, [job.jobId, timeIndex, view, pearsonAvailable]);
+  }, [job.jobId, timeIndex, view, pearsonAvailable, root]);
 
   // r 图与置信水平无关，只有阈值随 confidence 变 —— 每次改档位向后端要一次摘要
   useEffect(() => {
-    if (!pearsonAvailable) return undefined;
+    if (!pearsonAvailable || !showSkill) return undefined;
     const controller = new AbortController();
-    fetch(`${API_BASE}/api/chain/jobs/${job.jobId}/pearson?confidence=${confidence}`, {
+    fetch(`${root}/pearson?confidence=${confidence}`, {
       signal: controller.signal,
     })
       .then(async (res) => {
@@ -281,12 +282,12 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
         if (err.name !== 'AbortError') setError(err.message);
       });
     return () => controller.abort();
-  }, [job.jobId, confidence, pearsonAvailable]);
+  }, [job.jobId, confidence, pearsonAvailable, root, showSkill]);
 
   useEffect(() => {
     if (!pearsonAvailable) return undefined;
     const controller = new AbortController();
-    fetch(`${API_BASE}/api/chain/jobs/${job.jobId}/focus-region`, { signal: controller.signal })
+    fetch(`${root}/focus-region`, { signal: controller.signal })
       .then(async (res) => {
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || `重点区域评价读取失败 (${res.status})`);
@@ -297,7 +298,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
         if (err.name !== 'AbortError') setError(err.message);
       });
     return () => controller.abort();
-  }, [job.jobId, pearsonAvailable]);
+  }, [job.jobId, pearsonAvailable, root]);
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -450,7 +451,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
               rows={frame?.rows || MAP_ROWS}
               cols={frame?.cols || MAP_COLS}
               geoData={geoData}
-              showContour={view !== 'error'}
+              showContour={false}
             >
               <canvas
                 ref={canvasRef}
@@ -475,6 +476,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
                 onChange={(event) => setTimeIndex(Number(event.target.value))}
               />
             </label>
+            {children}
           </div>
         </div>
 
@@ -523,17 +525,23 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
                 {' · '}区域内 {focus.region.gridPoints} 个格点按现有蓝框口径作算术平均
                 {' · '}有效日期 {focus.pairedDays}/112
               </p>
-              <ResponsiveContainer width="100%" height={250}>
-                <LineChart data={focusChartData}>
+              <div className="focus-series-chart">
+                <div className="focus-series-axis-label">区域平均降水距平（mm/天）</div>
+                <ResponsiveContainer width="100%" height={250}>
+                <LineChart data={focusChartData} margin={{ top: 8, right: 8, bottom: 14, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="day" label={{ value: '时间步', position: 'insideBottom', offset: -5 }} fontSize={11} />
-                  <YAxis label={{ value: '区域平均降水距平 (mm/天)', angle: -90, position: 'insideLeft' }} fontSize={11} />
-                  <Tooltip labelFormatter={(_, entries) => entries?.[0]?.payload?.date || '—'} formatter={(value) => (value == null ? '—' : Number(value).toFixed(4))} />
-                  <Legend />
+                  <XAxis dataKey="day" ticks={[1, 15, 29, 43, 57, 71, 85, 99, 112]} minTickGap={24} label={{ value: '时间步', position: 'insideBottom', offset: -8, fontSize: 12 }} fontSize={11} />
+                  <YAxis width={38} fontSize={11} />
+                  <Tooltip labelFormatter={(_, entries) => entries?.[0]?.payload?.date || '—'} formatter={(value) => (value == null ? '—' : String(value))} />
                   <Line type="monotone" dataKey="truth" name="区域平均实况" stroke="#1a478a" dot={false} strokeWidth={2} />
                   <Line type="monotone" dataKey="prediction" name="区域平均预测" stroke="#e63946" dot={false} strokeWidth={2} strokeDasharray="4 2" />
                 </LineChart>
-              </ResponsiveContainer>
+                </ResponsiveContainer>
+              </div>
+              <div className="focus-series-legend" aria-label="区域曲线图例">
+                <span className="focus-series-truth"><i />区域平均实况</span>
+                <span className="focus-series-prediction"><i />区域平均预测</span>
+              </div>
               <div className="focus-evaluation-groups">
                 <section className="focus-evaluation-group">
                   <h4>区域平均序列评价</h4>
@@ -545,7 +553,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
                     ].map(([label, value, unit]) => (
                       <div className="focus-metric" key={label}>
                         <span>{label}</span>
-                        <strong>{value == null ? '无定义' : value.toFixed(4)}</strong>
+                        <strong>{value == null ? '无定义' : value}</strong>
                         {unit && <small>{unit}</small>}
                       </div>
                     ))}
@@ -554,19 +562,19 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
                 <section className="focus-evaluation-group">
                   <h4>区域内格点评价</h4>
                   <div className="prediction-summary">
-                    <span>逐格点 r 平均</span><strong>{focus.meanPointR == null ? '无定义' : focus.meanPointR.toFixed(4)}</strong>
+                    <span>逐格点 r 平均</span><strong>{focus.meanPointR == null ? '无定义' : focus.meanPointR}</strong>
                     <span>r 有定义格点</span><strong>{focus.definedPointR} / {focus.definedPointR + focus.undefinedPointR}</strong>
                   </div>
                 </section>
               </div>
               <p className="chart-note">序列指标对应上方区域平均预测与实况；格点指标评价区域内部各格点的时间相关性。</p>
-              <a className="download-prediction-btn" href={`${API_BASE}/api/chain/jobs/${job.jobId}/download/focus-region`} download>
+              <a className="download-prediction-btn" href={`${root}/download/focus-region`} download>
                 下载重点区域逐日序列 CSV
               </a>
             </div>
           )}
 
-          <div className="result-card">
+          {showRunSummary && <div className="result-card">
             <details className="model-run-details">
             <summary className="result-title">模型运行摘要与数据下载</summary>
             <div className="prediction-summary">
@@ -601,7 +609,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
               下载 prediction_{downloadCombo}.npy
             </a>
             </details>
-          </div>
+          </div>}
         </div>
       </div>
 
@@ -616,7 +624,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
         </div>
       )}
 
-      {pearsonAvailable && (
+      {pearsonAvailable && showSkill && (
         <div className="result-row">
           <div className="result-col">
             <div className="result-card">
@@ -659,7 +667,7 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
                     <span>已选格点</span>
                     <strong>{lon.toFixed(2)}°E，{lat.toFixed(2)}°N</strong>
                     <span>Pearson 系数</span>
-                    <strong>{finite ? `r = ${value.toFixed(4)}` : 'r 无定义'}</strong>
+                    <strong>{finite ? `r = ${value}` : 'r 无定义'}</strong>
                     <span className={`pearson-point-status ${significant ? 'is-significant' : ''}`}>
                       {finite
                         ? (significant ? '达到当前显著性阈值' : '未达到当前显著性阈值')
@@ -682,9 +690,9 @@ export default function LivePredictionResult({ job, confidence = '0.95' }) {
               <h3 className="result-title">技巧摘要</h3>
               {pearson ? (
                 <div className="prediction-summary">
-                  <span>平均相关系数</span><strong>{pearson.meanR.toFixed(4)}</strong>
-                  <span>中位数</span><strong>{pearson.medianR.toFixed(4)}</strong>
-                  <span>范围</span><strong>{pearson.minR.toFixed(3)} ～ {pearson.maxR.toFixed(3)}</strong>
+                  <span>平均相关系数</span><strong>{pearson.meanR}</strong>
+                  <span>中位数</span><strong>{pearson.medianR}</strong>
+                  <span>范围</span><strong>{pearson.minR} ～ {pearson.maxR}</strong>
                   <span>正相关格点</span><strong>{(pearson.positiveFraction * 100).toFixed(1)}%</strong>
                   <span>显著正相关（有技巧）</span>
                   <strong>{(pearson.significantPositiveFraction * 100).toFixed(1)}%</strong>

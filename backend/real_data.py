@@ -350,7 +350,7 @@ def gen_time_series(year=2019, lead=6, grid_i=40, grid_j=50):
     return {
         "real": real.tolist(),
         "pred": pred.tolist(),
-        "r": round(float(r), 4),
+        "r": float(r),
         "source": "dataset",
     }
 
@@ -364,9 +364,9 @@ def gen_results_table(year=2019, lead=6):
         real = _load_npy(lead, year, fold, "real2").flatten()
         table.append({
             "experiment": fold,
-            "pearsonR": round(_pearson_r(real, pred), 3),
-            "rmse": round(float(np.sqrt(np.mean((pred - real) ** 2))), 3),
-            "mae": round(float(np.mean(np.abs(pred - real))), 3),
+            "pearsonR": _pearson_r(real, pred),
+            "rmse": float(np.sqrt(np.mean((pred - real) ** 2))),
+            "mae": float(np.mean(np.abs(pred - real))),
             "source": "dataset",
         })
     return table

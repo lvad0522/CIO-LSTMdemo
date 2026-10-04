@@ -30,7 +30,7 @@
 .logo h1 {
   margin: 0;
   font-family: "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
-  font-size: 36px;
+  font-size: 32px;
   font-weight: 400;
   line-height: 1.15;
   letter-spacing: -.8px;
@@ -463,23 +463,26 @@
 }
 .pearson-point-readout {
   display: grid;
-  grid-template-columns: auto auto 1fr;
+  grid-template-columns: 100px minmax(0, 1fr);
   align-items: center;
   gap: 6px 10px;
   margin-top: 8px;
-  padding: 8px 10px;
+  padding: 12px 14px;
   border: 1px solid #cfdce2;
   border-radius: 5px;
   background: #f8fbfc;
   color: #65747b;
-  font-size: 11px;
+  font-size: 15px;
+  line-height: 1.6;
 }
 .pearson-point-readout strong {
   color: #244f60;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .pearson-point-status {
-  justify-self: end;
+  grid-column: 1 / -1;
+  justify-self: start;
   color: #8b6b2d;
 }
 .pearson-point-status.is-significant { color: #25735d; }
@@ -523,7 +526,7 @@
   color: #666;
   font-size: 13px;
 }
-.prediction-summary strong { color: #1a478a; font-variant-numeric: tabular-nums; }
+.prediction-summary strong { color: #1a478a; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .smoke-warning {
   margin-top: 12px;
   padding: 8px 10px;
@@ -630,6 +633,35 @@
   flex: 1;
   min-width: 0;
 }
+
+/* 左侧技能卡与右侧模型对比、实验评价两张卡共享行高。 */
+.overview-row { align-items: stretch; margin-bottom: 18px; }
+.overview-row > .result-col { display: flex; flex-direction: column; gap: 18px; }
+.overview-row > .result-col > .result-card { margin-bottom: 0; }
+.overview-row > .result-col:first-child > .result-card,
+.overview-row > .result-col:last-child > .result-card:last-child { flex: 1; }
+
+.focus-series-chart { display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: center; }
+.focus-series-axis-label {
+  writing-mode: vertical-rl;
+  justify-self: center;
+  color: #666;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.focus-series-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px 20px;
+  margin: 6px 0 16px;
+  font-size: 12px;
+}
+.focus-series-legend > span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.focus-series-legend i { display: inline-block; width: 20px; border-top: 2px solid currentColor; }
+.focus-series-truth { color: #1a478a; }
+.focus-series-prediction { color: #e63946; }
+.focus-series-prediction i { border-top-style: dashed; }
 
 /* --- CIO 链路诊断 --- */
 .cio-figure-grid {
@@ -1132,6 +1164,7 @@
 .table-wrap { overflow-x: auto; }
 .results-table {
   width: 100%;
+  table-layout: fixed;
   border-collapse: collapse;
   font-size: 13px;
 }
@@ -1143,10 +1176,15 @@
   font-weight: 600;
 }
 .results-table td {
-  padding: 8px 14px;
+  padding: 8px 6px;
   text-align: center;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
   border-bottom: 1px solid #e8ecf0;
 }
+.results-table th:first-child { width: 18%; }
+.results-table td:not(:first-child) { white-space: nowrap; }
+.results-table .export-btn { padding: 6px 8px; white-space: nowrap; }
 .results-table tr:nth-child(even) { background: #f8fafc; }
 .results-table tr:hover { background: #eef4fb; }
 .results-table td.good { color: #27ae60; font-weight: 600; }
@@ -1407,10 +1445,10 @@
 .focus-evaluation-groups { display: grid; gap: 12px; margin-top: 16px; }
 .focus-evaluation-group { padding: 12px; background: #f5f8fc; border-radius: 8px; }
 .focus-evaluation-group h4 { margin: 0 0 10px; font-size: 12px; color: #24566a; }
-.focus-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-.focus-metric { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.focus-metrics { display: grid; gap: 10px; }
+.focus-metric { display: grid; grid-template-columns: 70px minmax(0, 1fr) auto; align-items: center; gap: 10px; min-width: 0; }
 .focus-metric span, .focus-metric small { font-size: 11px; color: #687b8c; }
-.focus-metric strong { font-size: 18px; color: #1a478a; font-variant-numeric: tabular-nums; }
+.focus-metric strong { font-size: 16px; color: #1a478a; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .model-run-details summary { cursor: pointer; margin-bottom: 0; display: list-item; }
 .model-run-details[open] summary { margin-bottom: 16px; }
 @container (max-width: 600px) {

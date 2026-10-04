@@ -6,6 +6,7 @@ import RunButton from './components/RunButton';
 import SkillMap from './components/SkillMap';
 // import TimeSeriesChart from './components/TimeSeriesChart';
 import ModelCompareChart from './components/ModelCompareChart';
+import DatasetEvaluation from './components/DatasetEvaluation';
 import ResultsTable from './components/ResultsTable';
 import CioProjectionResult from './components/CioProjectionResult';
 import NormalizationPanel from './components/NormalizationPanel';
@@ -14,6 +15,7 @@ import './App.css';
 
 // 开发期默认走 Vite 同源代理；第二套后端仍可用 VITE_API_BASE 覆盖。
 const API_BASE = import.meta.env.VITE_API_BASE || '';
+const DATA_API_BASE = import.meta.env.VITE_DATA_API_BASE || API_BASE;
 
 const FALLBACK_MODEL_CATALOG = {
   leads: [{
@@ -64,6 +66,7 @@ export default function App() {
   const [params, setParams] = useState(defaultParams);
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState(null);
+  const [selectedExperiment, setSelectedExperiment] = useState(null);
   const [error, setError] = useState(null);
   // 时序图当前格点（默认 (40,50) 与 /api/run 默认一致；点击热力图后更新）
   // 显示顺序统一为 (经度, 纬度) = (j, i)：横轴=经度、纵轴=纬度（2026-08-25）
@@ -84,6 +87,10 @@ export default function App() {
   const [chainJob, setChainJob] = useState(null);
 
   const uploadMode = dataSource === 'upload';
+  const activeFold = selectedExperiment?.year === results?.evaluationYear
+    && selectedExperiment?.lead === results?.evaluationLead
+    && results?.table?.some(row => row.experiment === selectedExperiment.fold)
+    ? selectedExperiment.fold : results?.table?.[0]?.experiment;
 
   useEffect(() => {
     if (!uploadMode || modelCatalogRequestRef.current) return undefined;
@@ -233,10 +240,10 @@ export default function App() {
         cio_region: params.cioRegion,
         significance: params.cioSignificance,
       }).toString();
-      const res = await fetch(`${API_BASE}/api/run?${query}`);
+      const res = await fetch(`${DATA_API_BASE}/api/run?${query}`);
       if (!res.ok) throw new Error(`API 返回 ${res.status}`);
       const data = await res.json();
-      setResults(data);
+      setResults({ ...data, evaluationYear: params.predYear, evaluationLead: params.leadTime });
     } catch (err) {
       setError(err.message || '连接后端失败，请确认后端已启动');
       console.error('请求失败:', err);
@@ -250,7 +257,7 @@ export default function App() {
     try {
       // 携带当前 year/lead，保证点击时序与显示地图组合一致
       const query = new URLSearchParams({ i, j, region, year: params.predYear, lead: params.leadTime }).toString();
-      const res = await fetch(`${API_BASE}/api/grid?${query}`);
+      const res = await fetch(`${DATA_API_BASE}/api/grid?${query}`);
       if (!res.ok) {
         console.warn('格点查询返回', res.status);
         return;
@@ -269,8 +276,8 @@ export default function App() {
   // `.npy` 入口跳过①；只跑投影的完成态下③ 是"本次未运行"而不是"待运行"
   const stage1Skipped = Boolean(chainJob?.projection?.stage1Skipped);
   const projectionOnlyDone = stageStatus === 'completed' && stageIndex === STAGE_NORMALIZATION;
-  // 只跑投影时侧栏显示被锁死的投影口径，全链时显示预测口径与置信水平（design D13）
-  const paramModule = uploadMode && runScope === 'projection' ? 'cio' : 'lstm';
+  // 两种运行范围共用年份、提前期、区域和显著性参数面板。
+  const paramModule = 'lstm';
   const stageLabel = (n) => {
     if (n === STAGE_PROJECTION && stage1Skipped) return '投影CIO（已跳过）';
     if (n === STAGE_PREDICTION && projectionOnlyDone) return 'LSTM降水（本次未运行）';
@@ -288,7 +295,7 @@ export default function App() {
     <div className="app">
       <aside className="sidebar">
         <div className="logo" lang="en">
-          <h1>CIO-Rain</h1>
+          <h1>CIO-RainCast</h1>
           <p>East Asian Summer Monsoon Intraseasonal Rainfall Prediction</p>
         </div>
 
@@ -411,7 +418,7 @@ export default function App() {
 
         {results && !uploadMode && (
           <>
-            <div className="result-row">
+            <div className="result-row overview-row">
               <div className="result-col">
                 <SkillMap
                   data={results.skillMap}
@@ -429,9 +436,11 @@ export default function App() {
                 />
                 */}
                 <ModelCompareChart data={results.s2s} />
+                <ResultsTable data={results.table} selectedFold={activeFold}
+                  onSelectFold={fold => setSelectedExperiment({ year: results.evaluationYear, lead: results.evaluationLead, fold })} />
               </div>
             </div>
-            <ResultsTable data={results.table} />
+            <DatasetEvaluation key={`${results.evaluationYear}-${results.evaluationLead}`} year={results.evaluationYear} lead={results.evaluationLead} fold={activeFold} />
           </>
         )}
 

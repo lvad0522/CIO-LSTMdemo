@@ -149,7 +149,7 @@ export default function IntroAnimation({ onComplete }) {
   return (
     <div
       className="intro-animation" ref={overlayRef}
-      role="dialog" aria-modal="true" aria-label="CIO-Rain opening animation"
+      role="dialog" aria-modal="true" aria-label="CIO-RainCast opening animation"
       onKeyDown={event => { if (event.key === 'Escape') onComplete(); }}
     >
       <div className="intro-composition" lang="en">
@@ -157,7 +157,7 @@ export default function IntroAnimation({ onComplete }) {
           <canvas ref={canvasRef} aria-hidden="true" />
         </div>
         <div className="intro-wordmark">
-          <h1>CIO-Rain</h1>
+          <h1>CIO-RainCast</h1>
           <p>
             <span>East Asian Summer Monsoon</span>
             <span>Intraseasonal Rainfall</span>

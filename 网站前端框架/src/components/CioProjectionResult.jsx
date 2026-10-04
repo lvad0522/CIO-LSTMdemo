@@ -39,7 +39,7 @@ function formatWindow(window) {
   return `${window[0][0]}月${window[0][1]}日 - ${window[1][0]}月${window[1][1]}日`;
 }
 
-function useCioDiagnostics(jobId, confidence) {
+function useCioDiagnostics(jobId) {
   const [data, setData] = useState({
     capabilities: null,
     reference: null,
@@ -60,7 +60,7 @@ function useCioDiagnostics(jobId, confidence) {
       mode: '/api/cio/mode/u850',
       series: `/api/chain/jobs/${jobId}/series`,
       completeness: `/api/chain/jobs/${jobId}/completeness`,
-      spectrum: `/api/chain/jobs/${jobId}/spectrum?confidence=${confidence}`,
+      // spectrum: `/api/chain/jobs/${jobId}/spectrum?confidence=${confidence}`,
     };
     Promise.all(Object.entries(endpoints).map(async ([key, path]) => {
       const response = await fetch(`${API_BASE}${path}`);
@@ -75,7 +75,7 @@ function useCioDiagnostics(jobId, confidence) {
         if (alive) setError(reason.message || 'CIO 诊断数据加载失败');
       });
     return () => { alive = false; };
-  }, [jobId, confidence]);
+  }, [jobId]);
 
   return { data, error };
 }
@@ -565,10 +565,10 @@ function coverageRows(completeness, length = 0) {
   ];
 }
 
-function formatPower(value) {
-  if (!Number.isFinite(value) || value <= 0) return '-';
-  return value >= 0.01 && value < 1000 ? value.toFixed(3) : value.toExponential(1);
-}
+// function formatPower(value) {
+//   if (!Number.isFinite(value) || value <= 0) return '-';
+//   return value >= 0.01 && value < 1000 ? value.toFixed(3) : value.toExponential(1);
+// }
 
 const MAT_SOURCE_LABELS = {
   real: 'real（服务器真件，e·eᵀ 过正交判据）',
@@ -588,8 +588,8 @@ function matIdentityText(projection, mode) {
   return parts.join(' · ');
 }
 
-export default function CioProjectionResult({ job, confidence = '0.95' }) {
-  const { data, error } = useCioDiagnostics(job.jobId, confidence);
+export default function CioProjectionResult({ job }) {
+  const { data, error } = useCioDiagnostics(job.jobId);
   const coastlines = useCioDomainCoastlines();
   const previewEnabled = job.projectionMode === 'u850_only'
     && (job.inputKind || job.projection?.inputKind) === 'raw-zip';
@@ -630,17 +630,18 @@ export default function CioProjectionResult({ job, confidence = '0.95' }) {
         ? `（${targetWindow.year} 年）`
         : ''
     : '';
-  const spectrumData = useMemo(() => {
-    const spectrum = data.spectrum;
-    if (!spectrum?.available) return [];
-    return spectrum.periodDays.map((period, index) => ({
-      period,
-      projectedPower: spectrum.projectedPower[index],
-      projectedConfidence: spectrum.projectedConfidence[index],
-      actualPower: spectrum.actualPower?.[index],
-      actualConfidence: spectrum.actualConfidence?.[index],
-    }));
-  }, [data.spectrum]);
+  // (c) 图停用，对应数据映射一并保留为注释。
+//   const spectrumData = useMemo(() => {
+//     const spectrum = data.spectrum;
+//     if (!spectrum?.available) return [];
+//     return spectrum.periodDays.map((period, index) => ({
+//       period,
+//       projectedPower: spectrum.projectedPower[index],
+//       projectedConfidence: spectrum.projectedConfidence[index],
+//       actualPower: spectrum.actualPower?.[index],
+//       actualConfidence: spectrum.actualConfidence?.[index],
+//     }));
+//   }, [data.spectrum]);
   const calendarKnown = Boolean(data.series?.calendarKnown);
   const lineLabel = job.projectionMode === 'u850_only'
     ? 'U850-only 投影（链路诊断）'
@@ -681,7 +682,7 @@ export default function CioProjectionResult({ job, confidence = '0.95' }) {
           <div>
             <h3 className="result-title" style={{ margin: 0 }}>CIO 计算与链路诊断</h3>
             <p className="metric-note" style={{ margin: '6px 0 0' }}>
-              当前启用真实 U850/上传 CIO 数据及其分块诊断谱；SST 联合投影尚未接入。
+              当前启用真实 U850/上传 CIO 数据及其序列诊断；SST 联合投影尚未接入。
             </p>
           </div>
           <span className="region-badge">{job.projectionMode === 'u850_only' ? 'U850-only' : '序列检查'}</span>
@@ -722,7 +723,6 @@ export default function CioProjectionResult({ job, confidence = '0.95' }) {
               对照论文 Figure 3 的结构；只绘制当前链路能证明的数据。
             </p>
           </div>
-          <span className="region-badge">置信水平 {(Number(confidence) * 100).toFixed(0)}%</span>
         </div>
         <div className="cio-figure-grid">
           <section className="cio-panel cio-panel-wide">
@@ -742,7 +742,7 @@ export default function CioProjectionResult({ job, confidence = '0.95' }) {
             ) : <EmptyPanel label="正在读取序列" reason="等待任务序列端点" />}
           </section>
 
-          <section className="cio-panel">
+          <section className="cio-panel cio-panel-wide">
             <span className="cio-panel-tag">(b)</span>
             <h4>目标年 112 点窗口放大{targetWindowLabel}</h4>
             {zoomData.length ? (
@@ -766,6 +766,7 @@ export default function CioProjectionResult({ job, confidence = '0.95' }) {
             )}
           </section>
 
+          {/* (c) 功率谱暂时停用；保留代码便于恢复。
           <section className="cio-panel">
             <span className="cio-panel-tag">(c)</span>
             <h4>CIO 不同时间尺度的波动强度{data.spectrum?.available ? `（${data.spectrum.blockCount} 个窗口平均）` : ''}</h4>
@@ -817,6 +818,7 @@ export default function CioProjectionResult({ job, confidence = '0.95' }) {
                 : '不跨年份缺口拼接序列，也不使用 Pearson 临界 r 代替谱置信线。'}
             </p>
           </section>
+          */}
         </div>
         <div className="cio-line-key">
           {calendarKnown && <span><i className="is-actual" />实际 CIO（EOF PC1）</span>}

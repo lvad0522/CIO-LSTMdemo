@@ -32,7 +32,10 @@ from real_data import (
 from cio_diagnostics import asset_router as cio_asset_router
 from chain import router as chain_router
 
+from dataset_evaluation import router as dataset_router
+
 app = FastAPI(title="CIO+LSTM 降水预测 API")
+app.include_router(dataset_router)
 # 两个 router 前缀互不重叠：/api/cio（投影诊断）、/api/chain（一条链）。
 # `/api/chain` 是独立前缀，与 /api/cio 无路由冲突，也不吞掉它任何端点。
 #
