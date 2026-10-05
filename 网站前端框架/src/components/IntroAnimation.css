@@ -19,7 +19,11 @@
   gap: clamp(20px, 4vw, 70px);
   width: min(1400px, 94vw);
 }
-.intro-globe { opacity: var(--globe-opacity); }
+.intro-globe {
+  opacity: var(--globe-opacity);
+  width: min(100%, calc(100dvh - 80px));
+  justify-self: center;
+}
 .intro-globe canvas { display: block; width: 100%; aspect-ratio: 1; }
 .intro-wordmark { text-align: center; padding-right: 2vw; }
 .intro-wordmark h1 {
